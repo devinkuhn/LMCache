@@ -67,9 +67,7 @@ class VLLM_Detector(EngineDetector):
             split = [
                 t.reshape(*t.shape[:3], 2, t.shape[3] // 2)
                 if (
-                    isinstance(t, torch.Tensor)
-                    and t.dim() == 4
-                    and t.shape[3] % 2 == 0
+                    isinstance(t, torch.Tensor) and t.dim() == 4 and t.shape[3] % 2 == 0
                 )
                 else t
                 for t in kv_caches
