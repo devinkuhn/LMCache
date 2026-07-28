@@ -55,6 +55,11 @@ class MLAAttentionSpec:
 
 
 @dataclass
+class MambaSpec:
+    block_size: int
+
+
+@dataclass
 class UniformTypeKVCacheSpecs:
     block_size: int
     kv_cache_specs: "dict[str, object]" = field(default_factory=dict)
@@ -212,6 +217,20 @@ def test_physical_block_multiplier_does_not_confuse_compression():
     assert spec[0].physical_blocks_per_engine_block == 1
 
 
+def test_physical_block_multiplier_skips_non_dcp_page_axes():
+    """A small Mamba-style page pool is not a split manager block axis."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[MockKVCacheGroup(["mamba.0"], MambaSpec(block_size=16))],
+            num_blocks=32,
+        ),
+        {"mamba.0": torch.randn(2, 16, 128, dtype=torch.bfloat16)},
+        dcp_size=4,
+    )
+
+    assert spec[0].physical_blocks_per_engine_block == 1
+
+
 @pytest.mark.parametrize(
     "spec,match",
     [
@@ -239,7 +258,10 @@ def test_nonintegral_physical_block_multiplier_is_rejected():
         create_engine_group_infos_from_vllm(
             MockKVCacheConfig(
                 kv_cache_groups=[
-                    MockKVCacheGroup(["idx.0"], MLAAttentionSpec(block_size=128))
+                    MockKVCacheGroup(
+                        ["idx.0"],
+                        MLAAttentionSpec(block_size=128, dcp_replicated=True),
+                    )
                 ],
                 num_blocks=32,
             ),

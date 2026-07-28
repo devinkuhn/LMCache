@@ -56,15 +56,21 @@ def effective_tokens_per_block(spec: Any, dcp_size: int = 1) -> int:
 def _physical_blocks_per_engine_block(
     kv_cache_config: Any,
     physical_num_blocks: int,
+    spec: Any,
+    dcp_size: int,
 ) -> int:
     """Return how many physical kernel blocks back one manager block ID.
 
-    vLLM may split a scheduler-visible manager block into several kernel
-    blocks. The registered tensor's block count contains that expansion,
-    whereas ``KVCacheConfig.num_blocks`` is the manager block count. Deriving
-    the multiplier from counts avoids confusing virtual block splitting with
-    compressed layouts whose physical slot dimension is smaller.
+    Replicated or partially replicated DCP groups can split one
+    scheduler-visible manager block into several kernel blocks. Other layouts
+    do not expose a comparable manager/kernel block axis: notably a Mamba
+    state cache can have fewer physical pages than ``KVCacheConfig.num_blocks``.
+    Keep those layouts one-to-one instead of inferring geometry from unrelated
+    counts.
     """
+    if _kv_cache_cp_shard_count(spec, dcp_size) >= dcp_size:
+        return 1
+
     manager_num_blocks = getattr(kv_cache_config, "num_blocks", None)
     if manager_num_blocks is None:
         return 1
@@ -258,6 +264,11 @@ def create_engine_group_infos_from_vllm(
         physical_num_blocks = get_num_blocks(
             [normalized_kv_caches[indices[0]]], identity.engine_kv_format
         )
+        engine_spec = (
+            vllm_groups[identity.engine_group_idx].kv_cache_spec
+            if vllm_groups
+            else None
+        )
         infos.append(
             EngineGroupInfo(
                 engine_group_id=identity.engine_group_idx,
@@ -268,7 +279,10 @@ def create_engine_group_infos_from_vllm(
                 sw_size_tokens=_merge_layer_sw_sizes(per_layer_sw_size, indices),
                 physical_blocks_per_engine_block=(
                     _physical_blocks_per_engine_block(
-                        kv_cache_config, physical_num_blocks
+                        kv_cache_config,
+                        physical_num_blocks,
+                        engine_spec,
+                        dcp_size,
                     )
                     if vllm_groups
                     else 1
