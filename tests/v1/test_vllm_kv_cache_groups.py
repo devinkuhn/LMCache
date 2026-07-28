@@ -9,6 +9,7 @@ import torch
 # First Party
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
+    effective_tokens_per_block,
 )
 from lmcache.v1.multiprocess.group_view import (
     expand_engine_block_ids,
@@ -41,12 +42,20 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 class FullAttentionSpec:
     block_size: int
     sliding_window: "int | None" = None
+    dcp_replicated: bool = False
 
 
 @dataclass
 class MLAAttentionSpec:
     """Key-only, one-vector-per-token spec (an MLA index cache)."""
 
+    block_size: int
+    dcp_replicated: bool = False
+    dcp_kv_shard_count: "int | None" = None
+
+
+@dataclass
+class MambaSpec:
     block_size: int
 
 
@@ -65,6 +74,7 @@ class MockKVCacheGroup:
 @dataclass
 class MockKVCacheConfig:
     kv_cache_groups: list[MockKVCacheGroup]
+    num_blocks: "int | None" = None
 
 
 def _same_shape_caches(names: list[str]) -> dict[str, torch.Tensor]:
@@ -106,6 +116,158 @@ def test_conversion_preserves_engine_group_layers():
     assert num_engine_groups(spec) == 2
     assert get_engine_group_indices(spec, 4) == [0, 1, 0, 1]
     assert [group.tokens_per_block for group in spec] == [16, 16]
+
+
+def test_dcp_globalizes_only_sequence_sharded_group_block_spans():
+    """DCP-sharded MLA and replicated indexer groups share global chunks."""
+    caches = {
+        **_same_shape_caches(["main.0", "main.1"]),
+        **_mla_caches(["idx.0", "idx.1"]),
+    }
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(
+                    ["main.0", "main.1"],
+                    FullAttentionSpec(block_size=64),
+                ),
+                MockKVCacheGroup(
+                    ["idx.0", "idx.1"],
+                    MLAAttentionSpec(block_size=128, dcp_replicated=True),
+                ),
+            ]
+        ),
+        caches,
+        dcp_size=4,
+    )
+
+    # One local main-cache block spans 64 positions on each of four DCP
+    # ranks, while every rank holds a complete 128-token indexer block.
+    assert [group.tokens_per_block for group in spec] == [256, 128]
+
+
+def test_dcp_partial_replication_tracks_manager_and_physical_blocks():
+    """A partial indexer shard expands manager IDs to physical kernel IDs."""
+    caches = {
+        "main.0": torch.randn(32, 64, 656, dtype=torch.bfloat16),
+        "idx.0": torch.randn(64, 64, 132, dtype=torch.bfloat16),
+    }
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["main.0"], MLAAttentionSpec(block_size=64)),
+                MockKVCacheGroup(
+                    ["idx.0"],
+                    MLAAttentionSpec(block_size=128, dcp_kv_shard_count=2),
+                ),
+            ],
+            num_blocks=32,
+        ),
+        caches,
+        dcp_size=4,
+    )
+
+    assert [group.tokens_per_block for group in spec] == [256, 256]
+    assert [group.physical_blocks_per_engine_block for group in spec] == [1, 2]
+    assert expand_engine_block_ids(spec, [[10, 11], [20, 21]]) == [
+        [10, 11],
+        [40, 41, 42, 43],
+    ]
+
+
+def test_dcp_full_replication_expands_manager_blocks():
+    """A fully replicated manager page can contain several physical blocks."""
+    caches = {
+        "main.0": torch.randn(32, 64, 656, dtype=torch.bfloat16),
+        "idx.0": torch.randn(128, 64, 132, dtype=torch.bfloat16),
+    }
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["main.0"], MLAAttentionSpec(block_size=64)),
+                MockKVCacheGroup(
+                    ["idx.0"],
+                    MLAAttentionSpec(block_size=256, dcp_replicated=True),
+                ),
+            ],
+            num_blocks=32,
+        ),
+        caches,
+        dcp_size=4,
+    )
+
+    assert [group.tokens_per_block for group in spec] == [256, 256]
+    assert [group.physical_blocks_per_engine_block for group in spec] == [1, 4]
+    assert expand_engine_block_ids(spec, [[3], [7]]) == [[3], [28, 29, 30, 31]]
+
+
+def test_physical_block_multiplier_does_not_confuse_compression():
+    """A smaller slot dimension alone does not imply virtual block splitting."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["idx.0"], MLAAttentionSpec(block_size=16))
+            ],
+            num_blocks=32,
+        ),
+        {"idx.0": torch.randn(32, 8, 132, dtype=torch.bfloat16)},
+    )
+
+    assert spec[0].tokens_per_block == 16
+    assert spec[0].physical_blocks_per_engine_block == 1
+
+
+def test_physical_block_multiplier_skips_non_dcp_page_axes():
+    """A small Mamba-style page pool is not a split manager block axis."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[MockKVCacheGroup(["mamba.0"], MambaSpec(block_size=16))],
+            num_blocks=32,
+        ),
+        {"mamba.0": torch.randn(2, 16, 128, dtype=torch.bfloat16)},
+        dcp_size=4,
+    )
+
+    assert spec[0].physical_blocks_per_engine_block == 1
+
+
+@pytest.mark.parametrize(
+    "spec,match",
+    [
+        (
+            MLAAttentionSpec(block_size=128, dcp_kv_shard_count=3),
+            "positive divisor",
+        ),
+        (
+            MLAAttentionSpec(
+                block_size=128,
+                dcp_replicated=True,
+                dcp_kv_shard_count=2,
+            ),
+            "cannot be combined",
+        ),
+    ],
+)
+def test_dcp_invalid_shard_metadata_is_rejected(spec, match):
+    with pytest.raises(ValueError, match=match):
+        effective_tokens_per_block(spec, dcp_size=4)
+
+
+def test_nonintegral_physical_block_multiplier_is_rejected():
+    with pytest.raises(ValueError, match="whole multiple"):
+        create_engine_group_infos_from_vllm(
+            MockKVCacheConfig(
+                kv_cache_groups=[
+                    MockKVCacheGroup(
+                        ["idx.0"],
+                        MLAAttentionSpec(block_size=128, dcp_replicated=True),
+                    )
+                ],
+                num_blocks=32,
+            ),
+            {"idx.0": torch.randn(48, 64, 132, dtype=torch.bfloat16)},
+            dcp_size=2,
+        )
 
 
 def test_conversion_splits_by_lmcache_layer_identity():

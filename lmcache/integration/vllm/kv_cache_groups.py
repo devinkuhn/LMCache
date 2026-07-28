@@ -19,6 +19,77 @@ from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 logger = init_logger(__name__)
 
 
+def _kv_cache_cp_shard_count(spec: Any, dcp_size: int) -> int:
+    """Mirror vLLM's context-parallel KV shard-count contract."""
+    if dcp_size < 1:
+        raise ValueError(f"dcp_size must be positive, got {dcp_size}")
+    replicated = bool(getattr(spec, "dcp_replicated", False))
+    override = getattr(spec, "dcp_kv_shard_count", None)
+    if replicated:
+        if override not in (None, 1):
+            raise ValueError(
+                f"dcp_replicated cannot be combined with dcp_kv_shard_count={override}"
+            )
+        return 1
+    if override is None:
+        return dcp_size
+    override = int(override)
+    if override < 1 or override > dcp_size or dcp_size % override != 0:
+        raise ValueError(
+            "dcp_kv_shard_count must be a positive divisor of dcp_size, "
+            f"got shards={override}, dcp_size={dcp_size}"
+        )
+    return override
+
+
+def effective_tokens_per_block(spec: Any, dcp_size: int = 1) -> int:
+    """Return the global token span represented by one manager block ID.
+
+    A sequence-sharded cache block covers ``block_size`` positions on each
+    unique KV shard. Fully replicated groups have one shard; partially
+    replicated groups declare ``dcp_kv_shard_count``. This mirrors vLLM's
+    scheduler-side block geometry.
+    """
+    return int(spec.block_size) * _kv_cache_cp_shard_count(spec, dcp_size)
+
+
+def _physical_blocks_per_engine_block(
+    kv_cache_config: Any,
+    physical_num_blocks: int,
+    spec: Any,
+    dcp_size: int,
+) -> int:
+    """Return how many physical kernel blocks back one manager block ID.
+
+    Replicated or partially replicated DCP groups can split one
+    scheduler-visible manager block into several kernel blocks. Other layouts
+    do not expose a comparable manager/kernel block axis: notably a Mamba
+    state cache can have fewer physical pages than ``KVCacheConfig.num_blocks``.
+    Keep those layouts one-to-one instead of inferring geometry from unrelated
+    counts.
+    """
+    if _kv_cache_cp_shard_count(spec, dcp_size) >= dcp_size:
+        return 1
+
+    manager_num_blocks = getattr(kv_cache_config, "num_blocks", None)
+    if manager_num_blocks is None:
+        return 1
+    manager_num_blocks = int(manager_num_blocks)
+    if manager_num_blocks < 1:
+        raise ValueError(
+            f"KVCacheConfig.num_blocks must be positive, got {manager_num_blocks}"
+        )
+    if physical_num_blocks < manager_num_blocks or (
+        physical_num_blocks % manager_num_blocks
+    ):
+        raise ValueError(
+            "registered physical block count must be a whole multiple of "
+            "KVCacheConfig.num_blocks, got "
+            f"physical={physical_num_blocks}, manager={manager_num_blocks}"
+        )
+    return physical_num_blocks // manager_num_blocks
+
+
 def _is_sliding_window_spec(spec: Any) -> bool:
     """Return whether the KV cache spec is a vLLM sliding-window spec.
 
@@ -91,6 +162,7 @@ def create_engine_group_infos_from_vllm(
     kv_cache_config: Any,
     kv_caches: Mapping[str, Any],
     layout_hints: "LayoutHints | None" = None,
+    dcp_size: int = 1,
 ) -> list[EngineGroupInfo]:
     """Build the LMCache engine group infos from vLLM metadata and registered tensors.
 
@@ -110,6 +182,9 @@ def create_engine_group_infos_from_vllm(
             are inspected for physical shape and dtype.
         layout_hints: Optional engine-provided layout hints forwarded to format
             detection (e.g. ``NHD``/``HND`` and compression metadata).
+        dcp_size: Decode-context parallel size. Sequence-sharded groups expose
+            their global token span per manager block; replicated and partially
+            replicated groups use their actual unique KV shard count.
 
     Returns:
         The list of ``EngineGroupInfo`` in protocol order, i.e. the LMCache group
@@ -124,6 +199,7 @@ def create_engine_group_infos_from_vllm(
         EXCLUDED_ENGINE_GROUP,
         group_layers_by_identity,
     )
+    from lmcache.v1.gpu_connector.utils import get_num_blocks
 
     # vLLM-specific field access (confined to this function): map each
     # registered KV tensor to its vLLM engine KV cache group index. vLLM places
@@ -160,10 +236,12 @@ def create_engine_group_infos_from_vllm(
     if vllm_groups:
         per_layer_group_idx = [EXCLUDED_ENGINE_GROUP] * num_layers
         for engine_group_id, group in enumerate(vllm_groups):
-            # The spec's block_size is the logical tokens covered by one of
-            # this group's paged chunks (block IDs); the physical slot count
-            # per chunk is discovered later from the registered tensors.
-            group_tokens_per_block[engine_group_id] = group.kv_cache_spec.block_size
+            # Report the scheduler-visible global span of one block ID. The
+            # physical slot count is discovered later from registered tensors;
+            # their ratio naturally represents compression and/or DCP sharding.
+            group_tokens_per_block[engine_group_id] = effective_tokens_per_block(
+                group.kv_cache_spec, dcp_size
+            )
             for name in group.layer_names:
                 per_layer_group_idx[layer_to_idx[name]] = engine_group_id
         per_layer_sw_size = _resolve_per_layer_sw_sizes(
@@ -177,16 +255,38 @@ def create_engine_group_infos_from_vllm(
     # every resulting LMCache group can be served by a single copy kernel. It is
     # the shared, engine-neutral primitive the server reuses to reproduce the
     # same grouping from the registered tensors.
-    return [
-        EngineGroupInfo(
-            engine_group_id=identity.engine_group_idx,
-            layer_indices=tuple(indices),
-            tokens_per_block=group_tokens_per_block.get(identity.engine_group_idx, 0),
-            sw_size_tokens=_merge_layer_sw_sizes(per_layer_sw_size, indices),
+    infos: list[EngineGroupInfo] = []
+    for identity, indices in group_layers_by_identity(
+        normalized_kv_caches,
+        engine_kv_formats,
+        per_layer_group_idx,
+    ):
+        physical_num_blocks = get_num_blocks(
+            [normalized_kv_caches[indices[0]]], identity.engine_kv_format
         )
-        for identity, indices in group_layers_by_identity(
-            normalized_kv_caches,
-            engine_kv_formats,
-            per_layer_group_idx,
+        engine_spec = (
+            vllm_groups[identity.engine_group_idx].kv_cache_spec
+            if vllm_groups
+            else None
         )
-    ]
+        infos.append(
+            EngineGroupInfo(
+                engine_group_id=identity.engine_group_idx,
+                layer_indices=tuple(indices),
+                tokens_per_block=group_tokens_per_block.get(
+                    identity.engine_group_idx, 0
+                ),
+                sw_size_tokens=_merge_layer_sw_sizes(per_layer_sw_size, indices),
+                physical_blocks_per_engine_block=(
+                    _physical_blocks_per_engine_block(
+                        kv_cache_config,
+                        physical_num_blocks,
+                        engine_spec,
+                        dcp_size,
+                    )
+                    if vllm_groups
+                    else 1
+                ),
+            )
+        )
+    return infos

@@ -197,11 +197,14 @@ class KernelGroupInfo:
     :func:`parse_kvcache_shape_spec`, which have no detected format and never
     transfer; detection-built groups always set it."""
     tokens_per_block: int = 0
-    """Logical engine tokens covered by one paged chunk (one engine block
-    ID) of this group, as declared by the engine's KV cache spec at
-    initialization time (carried in ``EngineGroupInfo.tokens_per_block``).
-    ``0`` means the engine did not report it; the group is then treated as
-    uncompressed (``compress_ratio == 1``)."""
+    """Global tokens covered by one physical kernel block of this group.
+
+    The engine protocol carries manager-block geometry. Construction divides
+    it by ``physical_blocks_per_engine_block`` so transfer sizing is expressed
+    in the same physical block IDs that access the registered tensors.
+    ``0`` means the engine did not report geometry."""
+    physical_blocks_per_engine_block: int = 1
+    """Physical kernel blocks backing one engine manager block ID."""
     engine_group_idx: int = 0
     """Engine group index (paged-block address space). 0 for non-hybrid."""
     sw_size_tokens: int = -1
@@ -224,6 +227,8 @@ class KernelGroupInfo:
             f"dtype={self.dtype}, "
             f"tokens_per_block={self.tokens_per_block}, "
             f"slots_per_block={self.slots_per_block}, "
+            "physical_blocks_per_engine_block="
+            f"{self.physical_blocks_per_engine_block}, "
             f"engine_group_idx={self.engine_group_idx}, "
             f"sw_size_tokens={self.sw_size_tokens})"
         )
@@ -397,14 +402,30 @@ class KVLayerGroupsManager:
                     f"layers {indices}"
                 )
 
-            # tokens_per_block comes from the engine's KV cache spec; when
-            # absent, fall back to the physical slot count so the group is
-            # treated as non-compressed (compress_ratio == 1).
-            tokens_per_block = (
-                info.tokens_per_block
-                if info is not None and info.tokens_per_block > 0
-                else bs
+            physical_blocks_per_engine_block = (
+                info.physical_blocks_per_engine_block if info is not None else 1
             )
+            if physical_blocks_per_engine_block < 1:
+                raise ValueError(
+                    f"group {group_idx}: physical_blocks_per_engine_block must "
+                    f"be positive, got {physical_blocks_per_engine_block}"
+                )
+            # Convert scheduler-visible manager-block geometry to the physical
+            # block IDs used by transfer kernels. Older payloads default to a
+            # one-to-one mapping.
+            if info is not None and info.tokens_per_block > 0:
+                if info.tokens_per_block % physical_blocks_per_engine_block:
+                    raise ValueError(
+                        f"group {group_idx}: manager tokens_per_block "
+                        f"{info.tokens_per_block} must be divisible by "
+                        "physical_blocks_per_engine_block "
+                        f"{physical_blocks_per_engine_block}"
+                    )
+                tokens_per_block = (
+                    info.tokens_per_block // physical_blocks_per_engine_block
+                )
+            else:
+                tokens_per_block = bs
             sw_size_tokens = info.sw_size_tokens if info is not None else -1
 
             self._validate_block_chunk_size_config(
@@ -422,6 +443,7 @@ class KVLayerGroupsManager:
                     dtype=dt,
                     engine_kv_format=group_format,
                     tokens_per_block=tokens_per_block,
+                    physical_blocks_per_engine_block=(physical_blocks_per_engine_block),
                     engine_group_idx=engine_group_idx,
                     sw_size_tokens=sw_size_tokens,
                 )

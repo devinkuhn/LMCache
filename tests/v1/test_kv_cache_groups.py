@@ -44,8 +44,31 @@ def test_engine_group_infos_expand_engine_block_ids():
     ]
 
 
+def test_engine_group_infos_expand_virtual_kernel_blocks():
+    groups = [
+        EngineGroupInfo(0, (0,), physical_blocks_per_engine_block=1),
+        EngineGroupInfo(1, (1,), physical_blocks_per_engine_block=2),
+    ]
+
+    assert expand_engine_block_ids(groups, [[5, 6], [10, 11]]) == [
+        [5, 6],
+        [20, 21, 22, 23],
+    ]
+
+
+def test_engine_group_infos_reject_invalid_physical_multiplier():
+    groups = [EngineGroupInfo(0, (0,), physical_blocks_per_engine_block=0)]
+
+    try:
+        expand_engine_block_ids(groups, [[5]])
+    except ValueError as exc:
+        assert "must be positive" in str(exc)
+    else:
+        raise AssertionError("Expected invalid physical block multiplier to fail")
+
+
 def test_engine_group_info_old_payload_defaults_sw_size():
-    """A pre-sw_size_tokens msgspec payload decodes with the -1 default."""
+    """Older msgspec payloads decode with protocol-compatible defaults."""
     old_payload = {"engine_group_id": 0, "layer_indices": (0, 1)}
 
     decoded = msgspec.msgpack.decode(
@@ -53,6 +76,7 @@ def test_engine_group_info_old_payload_defaults_sw_size():
     )
 
     assert decoded.sw_size_tokens == -1
+    assert decoded.physical_blocks_per_engine_block == 1
 
 
 def test_engine_group_infos_msgspec_round_trip():
