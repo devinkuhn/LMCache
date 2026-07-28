@@ -672,6 +672,42 @@ class TestKernelAndObjectGroups:
         assert group.tokens_per_block // group.slots_per_block == 2
         assert manager.calculate_num_blocks(0, 256) == 16
 
+    def test_virtual_manager_blocks_use_physical_transfer_geometry(self):
+        """Manager-page metadata is converted to physical kernel blocks."""
+        tensors = [torch.randn(2, 64, 64, 1, 132, dtype=torch.float16)]
+        manager = _build_manager(
+            tensors,
+            engine_group_infos=[
+                EngineGroupInfo(
+                    0,
+                    (0,),
+                    tokens_per_block=256,
+                    physical_blocks_per_engine_block=2,
+                )
+            ],
+        )
+
+        group = manager.kernel_groups[0]
+        assert group.tokens_per_block == 128
+        assert group.physical_blocks_per_engine_block == 2
+        assert group.calculate_slots(256) == 128
+        assert manager.calculate_num_blocks(0, 256) == 2
+
+    def test_virtual_manager_block_geometry_must_divide_evenly(self):
+        tensors = [torch.randn(2, 64, 64, 1, 132, dtype=torch.float16)]
+        with pytest.raises(ValueError, match="must be divisible"):
+            _build_manager(
+                tensors,
+                engine_group_infos=[
+                    EngineGroupInfo(
+                        0,
+                        (0,),
+                        tokens_per_block=256,
+                        physical_blocks_per_engine_block=3,
+                    )
+                ],
+            )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

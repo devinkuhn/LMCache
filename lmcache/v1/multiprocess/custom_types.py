@@ -60,6 +60,13 @@ class IPCCacheServerKey:
     # ObjectKey.cache_salt). Validated in __post_init__.
     cache_salt: str = ""
 
+    # Number of engine workers that will retrieve each ObjectKey. This is
+    # transport metadata, not part of cache identity. A value of 0 preserves
+    # the legacy server-side inference from tp_size/world_size. DCP needs the
+    # explicit value because TP8/DCP4 has four KV objects with two readers per
+    # object, a geometry the legacy heuristic cannot represent.
+    readers_per_object: int = field(default=0, compare=False)
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
@@ -76,6 +83,11 @@ class IPCCacheServerKey:
                 f"cache_salt exceeds max length {self._SALT_MAX_LEN} "
                 f"(got {len(self.cache_salt)})"
             )
+        if self.readers_per_object < 0:
+            raise ValueError(
+                "readers_per_object must be non-negative, got "
+                f"{self.readers_per_object}"
+            )
 
     # Helper function for unit tests only
     @classmethod
@@ -89,6 +101,7 @@ class IPCCacheServerKey:
         end: int = 0,
         request_id: str = "",
         cache_salt: str = "",
+        readers_per_object: int = 0,
     ) -> "IPCCacheServerKey":
         """Create a key from token ids. Only used by the tests."""
         return cls(
@@ -100,6 +113,7 @@ class IPCCacheServerKey:
             end=end,
             request_id=request_id,
             cache_salt=cache_salt,
+            readers_per_object=readers_per_object,
         )
 
     def no_worker_id_version(self) -> "IPCCacheServerKey":
@@ -113,6 +127,7 @@ class IPCCacheServerKey:
             end=self.end,
             request_id=self.request_id,
             cache_salt=self.cache_salt,
+            readers_per_object=self.readers_per_object,
         )
 
 

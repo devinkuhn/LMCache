@@ -31,8 +31,14 @@ logger = init_logger(__name__)
 def compute_extra_count(
     tp_size: int,
     world_size: int,
+    readers_per_object: int = 0,
 ) -> int:
     """Compute extra count for MLA multi-reader locking.
+
+    New clients carry ``readers_per_object`` explicitly in the cache key.
+    This is required for MLA+DCP: TP8/DCP4 stores four sequence-shard objects,
+    and each object is read by two TP workers. The historical ``tp_size`` /
+    ``world_size`` heuristic cannot distinguish that geometry.
 
     Non-MLA: each TP worker owns a distinct KV shard,
       so each ObjectKey is retrieved by exactly 1
@@ -60,10 +66,14 @@ def compute_extra_count(
     Args:
         tp_size: Tensor-parallel size from the client.
         world_size: World size from the cache key.
+        readers_per_object: Explicit reader count, or 0 for the legacy
+            heuristic.
 
     Returns:
         Number of extra count (0 for non-MLA).
     """
+    if readers_per_object > 0:
+        return readers_per_object - 1
     tp = tp_size if tp_size > 1 else world_size
     return tp - 1 if tp > world_size else 0
 
@@ -257,7 +267,7 @@ class LookupModule:
             )
             return
 
-        extra_count = compute_extra_count(tp_size, world_size)
+        extra_count = compute_extra_count(tp_size, world_size, key.readers_per_object)
 
         chunk_hashes = self._ctx.token_hasher.compute_chunk_hashes(list(key.token_ids))
         if not chunk_hashes:
@@ -495,7 +505,9 @@ class LookupModule:
         # chunks 512..768 may leak). Revisit when sliding-window prefetch is on.
         obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
 
-        extra_count = compute_extra_count(tp_size, key.world_size)
+        extra_count = compute_extra_count(
+            tp_size, key.world_size, key.readers_per_object
+        )
 
         self._ctx.storage_manager.finish_read_prefetched(
             obj_keys, extra_count=extra_count

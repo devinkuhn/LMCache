@@ -42,16 +42,24 @@ class EngineGroupInfo(msgspec.Struct, frozen=True):
     """Registered KV tensor indices assigned to this group."""
 
     tokens_per_block: int = 0
-    """Logical tokens covered by one paged chunk (one engine block ID) of
-    this engine group, as declared by the engine's KV cache spec
-    (``kv_cache_spec.block_size`` for vLLM). ``0`` means the engine did not
-    report it; consumers then fall back to the physical slot count detected
-    from the registered tensors (i.e. the group is treated as
-    uncompressed)."""
+    """Global sequence tokens covered by one paged chunk (one engine block
+    ID) of this group. This normally equals the engine KV spec's block size;
+    sequence-sharded context parallel groups multiply it by their shard count,
+    while replicated groups do not. ``0`` means the engine did not report it;
+    consumers then fall back to the physical slot count detected from the
+    registered tensors (i.e. the group is treated as uncompressed)."""
 
     sw_size_tokens: int = -1
     """Sliding window size in tokens for the layers of this group.
     ``-1`` means the layers are not sliding-window attention."""
+
+    physical_blocks_per_engine_block: int = 1
+    """Number of physical kernel blocks backing one engine manager block ID.
+
+    vLLM can split one scheduler-visible block into consecutive physical block
+    IDs. ``1`` preserves the historical one-to-one protocol behavior and is
+    also the default when decoding payloads from older connectors.
+    """
 
 
 def num_engine_groups(groups: Sequence[EngineGroupInfo]) -> int:
@@ -84,25 +92,6 @@ def num_engine_group_infos(groups: Sequence[EngineGroupInfo]) -> int:
     if not groups:
         return 1
     return len(groups)
-
-
-def _engine_group_id_per_view(
-    groups: Sequence[EngineGroupInfo],
-) -> tuple[int, ...]:
-    """Return, per LMCache group, the engine group it draws block IDs from.
-
-    Args:
-        groups: The LMCache KV groups, in protocol order.
-
-    Returns:
-        A tuple whose length equals the number of LMCache groups (i.e.
-        :func:`num_engine_group_infos`); element ``i`` is the engine group id
-        that LMCache group ``i`` reads block IDs from. ``(0,)`` for an empty
-        ``groups`` (single non-hybrid group).
-    """
-    if not groups:
-        return (0,)
-    return tuple(group.engine_group_id for group in groups)
 
 
 def engine_group_layer_indices(
@@ -138,7 +127,9 @@ def expand_engine_block_ids(
 
     The serving engine reports block IDs per engine group. LMCache transfer
     requests are indexed by LMCache KV group, so each LMCache group reuses the
-    block IDs from its source engine group.
+    block IDs from its source engine group. If the serving engine virtually
+    splits one manager block, its ID ``b`` expands to consecutive physical IDs
+    ``b * N .. b * N + N - 1`` before LMCache accesses registered tensors.
 
     Args:
         groups: The LMCache KV groups, in protocol order.
@@ -148,7 +139,7 @@ def expand_engine_block_ids(
 
     Returns:
         Block IDs re-indexed by LMCache group order: one inner list per LMCache
-        group, copied from that group's source engine group.
+        group, expanded to physical kernel block IDs when required.
     """
     # Back-compat: older vLLM connectors emit a flat Sequence[int] for the
     # single (non-hybrid) engine group instead of one inner list per group.
@@ -160,10 +151,29 @@ def expand_engine_block_ids(
         ]
     else:
         per_group = cast("Sequence[Sequence[int]]", engine_side_block_ids)
-    return [
-        list(per_group[engine_group_id])
-        for engine_group_id in _engine_group_id_per_view(groups)
-    ]
+    if not groups:
+        return [list(per_group[0])]
+
+    expanded: list[list[int]] = []
+    for group in groups:
+        multiplier = group.physical_blocks_per_engine_block
+        if multiplier < 1:
+            raise ValueError(
+                "physical_blocks_per_engine_block must be positive, got "
+                f"{multiplier} for engine group {group.engine_group_id}"
+            )
+        manager_ids = per_group[group.engine_group_id]
+        if multiplier == 1:
+            expanded.append(list(manager_ids))
+        else:
+            expanded.append(
+                [
+                    block_id * multiplier + offset
+                    for block_id in manager_ids
+                    for offset in range(multiplier)
+                ]
+            )
+    return expanded
 
 
 def slice_block_ids_per_group(

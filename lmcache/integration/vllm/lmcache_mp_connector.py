@@ -45,6 +45,7 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
 )
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
+    effective_tokens_per_block,
 )
 from lmcache.integration.vllm.utils import mla_enabled, vllm_layout_hints
 from lmcache.utils import init_logger as lmcache_init_logger
@@ -195,6 +196,7 @@ def build_parallel_strategy_from_vllm_config(
         tp_size=pc.tensor_parallel_size,
         pp_size=pc.pipeline_parallel_size,
         n_servers=n_servers,
+        dcp_size=getattr(pc, "decode_context_parallel_size", 1),
     )
 
 
@@ -689,9 +691,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # full-attention groups 16; DeepSeek V4: 256/64/8/4). Falls back to
         # the engine's base block size when no group metadata is available
         # (single non-hybrid group).
+        dcp_size = parallel_strategy.dcp_size
         self._group_tokens_per_block: list[int] = [
-            group.kv_cache_spec.block_size for group in vllm_groups
-        ] or [vllm_config.cache_config.block_size]
+            effective_tokens_per_block(group.kv_cache_spec, dcp_size)
+            for group in vllm_groups
+        ] or [vllm_config.cache_config.block_size * dcp_size]
         for engine_group_idx, tokens_per_block in enumerate(
             self._group_tokens_per_block
         ):
@@ -755,6 +759,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             kv_cache_config,
             kv_caches,
             layout_hints=vllm_layout_hints(),
+            dcp_size=self.worker_adapter.parallel_strategy.dcp_size,
         )
         self.worker_adapter.register_kv_caches(
             kv_caches, engine_group_infos=engine_group_infos

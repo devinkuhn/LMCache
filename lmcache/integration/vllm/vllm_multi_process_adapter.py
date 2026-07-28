@@ -319,11 +319,38 @@ class ParallelStrategy:
     n_servers: int
     """Number of LMCache servers backing this deployment"""
 
+    dcp_size: int = 1
+    """Decode-context parallel size within the tensor-parallel group."""
+
+    def __post_init__(self) -> None:
+        if self.dcp_size < 1:
+            raise ValueError(f"dcp_size must be positive, got {self.dcp_size}")
+        if self.tp_size % self.dcp_size != 0:
+            raise ValueError(
+                f"tp_size ({self.tp_size}) must be divisible by "
+                f"dcp_size ({self.dcp_size})"
+            )
+        if self.use_mla and self.dcp_size > 1:
+            if self.pp_size != 1:
+                raise ValueError(
+                    "LMCache MLA+DCP currently requires pp_size=1; "
+                    f"got pp_size={self.pp_size}"
+                )
+            if self.n_servers != 1:
+                raise ValueError(
+                    "LMCache MLA+DCP currently requires one LMCache server; "
+                    f"got n_servers={self.n_servers}"
+                )
+
     @property
     def kv_world_size(self) -> int:
         """Number of pieces a single token chunk's KV cache is split into
         on the LMCache server storage."""
         if self.use_mla:
+            if self.dcp_size > 1:
+                # DCP shards KV across ranks inside TP. The remaining
+                # TP / DCP ranks hold query-parallel replicas of those shards.
+                return self.dcp_size
             # In this PR we do not support PP + TP + MLA in multi-server mode.
             # A precondition check enforces pp_size == 1, so kv_world_size for
             # MLA can be derived as world_size / tp_size.
@@ -336,19 +363,35 @@ class ParallelStrategy:
         that the current worker is responsible for,
         in ``[0, kv_world_size)``."""
         if self.use_mla:
+            if self.dcp_size > 1:
+                return self.vllm_worker_id % self.dcp_size
             return self.vllm_worker_id // self.tp_size
         return self.vllm_worker_id % (self.vllm_world_size // self.n_servers)
 
     @property
     def kv_tp_size(self) -> int:
         """Tensor-parallel size as seen from a single LMCache server."""
+        if self.use_mla and self.dcp_size > 1:
+            return self.tp_size // self.dcp_size
         return self.tp_size // self.n_servers
+
+    @property
+    def kv_readers_per_object(self) -> int:
+        """Number of workers that retrieve one stored KV object.
+
+        MLA shares each KV object across its query-parallel replicas. Under
+        DCP, ``dcp_size`` distinct sequence shards each have ``tp/dcp`` such
+        readers. Non-MLA workers own distinct KV objects.
+        """
+        return self.kv_tp_size if self.use_mla else 1
 
     @property
     def is_kv_writer(self) -> bool:
         """Whether this rank is responsible for storing KV."""
         if not self.use_mla:
             return True
+        if self.dcp_size > 1:
+            return self.vllm_worker_id < self.dcp_size
         # MLA: only first rank per node is a writer.
         return self.vllm_worker_id % (self.tp_size // self.n_servers) == 0
 
@@ -1036,6 +1079,7 @@ class LMCacheMPSchedulerAdapter:
             end=end,
             request_id=request_id,
             cache_salt=cache_salt,
+            readers_per_object=self.parallel_strategy.kv_readers_per_object,
         )
 
 
@@ -1119,14 +1163,14 @@ class LMCacheMPWorkerAdapter:
         self.transfer_ctx: TransferContext | None = None
 
         # Request futures
-        self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
+        self.store_futures: dict[str, list[MessagingFuture[StoreResult]]] = {}
         # request_id -> (future, block_ids)
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
         # The IPC handle is not enough by itself; CUDA needs the exporting
         # event object to stay alive until the consumer is done with it.
-        self.store_events: dict[str, _IpcEvent] = {}
+        self.store_events: dict[str, list[_IpcEvent]] = {}
         self.retrieve_events: dict[str, _IpcEvent] = {}
 
         # Block IDs that failed due to retrieve timeout
@@ -1427,8 +1471,11 @@ class LMCacheMPWorkerAdapter:
             event,
             self.blocks_in_chunk,
         )
-        self.store_futures[request_id] = future
-        self.store_events[request_id] = event
+        # Chunked prefill can submit multiple stores for one request before
+        # earlier stores finish. Keep every future and its exporting event.
+        self.finished_stores.discard(request_id)
+        self.store_futures.setdefault(request_id, []).append(future)
+        self.store_events.setdefault(request_id, []).append(event)
 
     @_lmcache_nvtx_annotate
     def submit_retrieve_request(
@@ -1556,6 +1603,41 @@ class LMCacheMPWorkerAdapter:
         self._returned_finished.update(ret_stores)
         return ret_stores
 
+    def _poll_store_futures(self) -> set[str]:
+        """Poll all chunk stores and retain events until their futures finish."""
+        finished_requests: set[str] = set()
+        for request_id, futures in list(self.store_futures.items()):
+            events = self.store_events.get(request_id, [])
+            if len(futures) != len(events):
+                raise RuntimeError(
+                    f"LMCache store future/event mismatch for {request_id}: "
+                    f"{len(futures)} futures vs {len(events)} events"
+                )
+
+            pending_futures: list[MessagingFuture[StoreResult]] = []
+            pending_events: list[_IpcEvent] = []
+            for future, event in zip(futures, events, strict=True):
+                if not future.query():
+                    pending_futures.append(future)
+                    pending_events.append(event)
+                    continue
+                if not future.result():
+                    logger.error(
+                        "Something went wrong when processing the "
+                        "store request for request_id=%s",
+                        request_id,
+                    )
+
+            if pending_futures:
+                self.store_futures[request_id] = pending_futures
+                self.store_events[request_id] = pending_events
+            else:
+                self.store_futures.pop(request_id, None)
+                self.store_events.pop(request_id, None)
+                finished_requests.add(request_id)
+
+        return finished_requests
+
     @_lmcache_nvtx_annotate
     def get_finished(
         self, finished_req_ids_from_engine: set[str]
@@ -1617,22 +1699,8 @@ class LMCacheMPWorkerAdapter:
             ret_stores -= finished_retrieves
             return ret_stores, finished_retrieves
 
-        finished_stores = set()
+        finished_stores = self._poll_store_futures()
         finished_retrieves = set()
-        for request_id, s_future in self.store_futures.items():
-            if not s_future.query():
-                continue
-
-            s_result = s_future.result()
-            finished_stores.add(request_id)
-
-            if not s_result:
-                logger.error(
-                    "Something went wrong when processing the "
-                    "store request for request_id=%s",
-                    request_id,
-                )
-
         for request_id, (r_future, _) in self.retrieve_futures.items():
             if not r_future.query():
                 continue
@@ -1648,10 +1716,7 @@ class LMCacheMPWorkerAdapter:
                     r_result,
                 )
 
-        # Remove the finished requests from the tracking dicts
-        for request_id in finished_stores:
-            self.store_futures.pop(request_id, None)
-            self.store_events.pop(request_id, None)
+        # Store futures and events are removed together by _poll_store_futures.
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
             self.retrieve_events.pop(request_id, None)

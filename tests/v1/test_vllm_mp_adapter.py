@@ -243,7 +243,41 @@ def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):
     assert transfer_ctx.submit_store.called
     assert transfer_ctx.submit_store.call_args.kwargs == {}
     assert transfer_ctx.submit_store.call_args.args[4] == [[0]]
-    assert adapter.store_futures["req-1"] is fake_future
+    assert adapter.store_futures["req-1"] == [fake_future]
+
+
+def test_chunked_store_keeps_all_futures_and_events(fake_adapter, monkeypatch):
+    adapter, _send_mock, _ = fake_adapter
+    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
+    fake_tensor = MagicMock()
+    fake_tensor.device.type = "cuda"
+    adapter.kv_caches = {"layer.0": fake_tensor}
+    transfer_ctx = MagicMock()
+    first_future = MagicMock()
+    second_future = MagicMock()
+    transfer_ctx.submit_store.side_effect = [first_future, second_future]
+    adapter.transfer_ctx = transfer_ctx
+    first_event = MagicMock()
+    second_event = MagicMock()
+
+    adapter.submit_store_request("req-1", _op([[0]]), event=first_event)
+    adapter.submit_store_request("req-1", _op([[1]]), event=second_event)
+
+    assert adapter.store_futures["req-1"] == [first_future, second_future]
+    assert adapter.store_events["req-1"] == [first_event, second_event]
+
+    first_future.query.return_value = True
+    first_future.result.return_value = True
+    second_future.query.return_value = False
+    assert adapter.get_finished(set()) == (set(), set())
+    assert adapter.store_futures["req-1"] == [second_future]
+    assert adapter.store_events["req-1"] == [second_event]
+
+    second_future.query.return_value = True
+    second_future.result.return_value = True
+    assert adapter.get_finished({"req-1"}) == ({"req-1"}, set())
+    assert "req-1" not in adapter.store_futures
+    assert "req-1" not in adapter.store_events
 
 
 def test_submit_store_request_expands_block_ids_to_views(fake_adapter, monkeypatch):
