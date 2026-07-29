@@ -514,20 +514,15 @@ class L1Manager:
             if allocated_objs:
                 self._memory_manager.free(allocated_objs)
                 allocated_objs = []
-            fit = self._estimate_alloc_fit(layout_desc, len(need_to_allocate))
-            while fit > 0:
-                err, allocated_objs = self._memory_manager.allocate(layout_desc, fit)
-                if err == L1Error.SUCCESS:
-                    logger.warning(
-                        "Partial L1 allocation: %d/%d objects (prefix) allocated",
-                        len(allocated_objs),
-                        len(need_to_allocate),
-                    )
-                    break
-                if allocated_objs:
-                    self._memory_manager.free(allocated_objs)
-                    allocated_objs = []
-                fit //= 2
+            err, allocated_objs = self._allocate_largest_prefix(
+                layout_desc, len(need_to_allocate)
+            )
+            if err == L1Error.SUCCESS:
+                logger.warning(
+                    "Partial L1 allocation: %d/%d objects (prefix) allocated",
+                    len(allocated_objs),
+                    len(need_to_allocate),
+                )
 
         if err != L1Error.SUCCESS:
             for key, _ in need_to_allocate:
@@ -565,31 +560,40 @@ class L1Manager:
         )
         return ret
 
-    def _estimate_alloc_fit(self, layout_desc: MemoryLayoutDesc, want: int) -> int:
-        """Conservatively estimate how many ``layout_desc``-sized objects
-        fit in the allocator's current free space.
+    def _allocate_largest_prefix(
+        self, layout_desc: MemoryLayoutDesc, want: int
+    ) -> tuple[L1Error, list[MemoryObj]]:
+        """Allocate the largest prefix below an already-failed full batch.
 
-        Args:
-            layout_desc: The memory layout of one object.
-            want: Upper bound on the number of objects wanted.
+        L1 allocators have an all-or-nothing batch contract. While holding the
+        L1 manager lock, allocation feasibility is therefore monotonic: if a
+        batch of size ``n`` fits, every smaller batch also fits. Binary search
+        finds the maximum without relying on byte estimates that can be wrong
+        for alignment or fragmented free lists. Successful probes are freed
+        before the final allocation.
 
-        Returns:
-            An object count between 0 and ``want``.
+        This recovery path runs only after the ``want`` allocation failed, so
+        normal reservations still perform exactly one allocation.
         """
-        per_obj = 0
-        for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=False):
-            numel = 1
-            for dim in shape:
-                numel *= int(dim)
-            per_obj += numel * dtype.itemsize
-        if per_obj <= 0:
-            return want // 2
-        # Headroom for alignment and allocator bookkeeping.
-        per_obj += 8192
-        used, total = self._memory_manager.get_memory_usage()
-        free = max(0, total - used)
-        fit = int(free * 0.98) // per_obj
-        return max(0, min(want, fit))
+        low = 1
+        high = want - 1
+        largest = 0
+
+        while low <= high:
+            candidate = (low + high) // 2
+            err, objects = self._memory_manager.allocate(layout_desc, candidate)
+            if err == L1Error.SUCCESS:
+                largest = candidate
+                self._memory_manager.free(objects)
+                low = candidate + 1
+            else:
+                if objects:
+                    self._memory_manager.free(objects)
+                high = candidate - 1
+
+        if largest == 0:
+            return L1Error.OUT_OF_MEMORY, []
+        return self._memory_manager.allocate(layout_desc, largest)
 
     @l1_mgr_synchronized
     def finish_write(

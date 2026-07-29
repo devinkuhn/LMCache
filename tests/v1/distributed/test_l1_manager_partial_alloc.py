@@ -9,6 +9,7 @@ OUT_OF_MEMORY. Uses the CPU shared-memory allocator, no GPU required.
 
 # Standard
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 # Third Party
 import pytest
@@ -116,3 +117,35 @@ def test_single_key_batch_keeps_all_or_nothing(manager: L1Manager) -> None:
     result = manager.reserve_write(keys, [False], OVERSIZED_LAYOUT)
 
     assert result[keys[0]] == (L1Error.OUT_OF_MEMORY, None)
+
+
+def test_largest_prefix_search_does_not_stop_at_a_smaller_fit() -> None:
+    """The OOM fallback finds the maximum, rather than accepting a midpoint."""
+
+    class BoundedMemoryManager:
+        def __init__(self, capacity: int) -> None:
+            self.capacity = capacity
+            self.allocate_counts: list[int] = []
+
+        def allocate(self, _layout: MemoryLayoutDesc, count: int):
+            self.allocate_counts.append(count)
+            if count > self.capacity:
+                return L1Error.OUT_OF_MEMORY, []
+            return L1Error.SUCCESS, [object() for _ in range(count)]
+
+        def free(self, _objects: list[object]) -> L1Error:
+            return L1Error.SUCCESS
+
+    memory_manager = BoundedMemoryManager(capacity=7)
+    manager = SimpleNamespace(_memory_manager=memory_manager)
+
+    err, objects = L1Manager._allocate_largest_prefix(
+        manager,
+        OBJECT_LAYOUT,
+        10,  # type: ignore[arg-type]
+    )
+
+    assert err == L1Error.SUCCESS
+    assert len(objects) == 7
+    assert memory_manager.allocate_counts[-1] == 7
+    assert 8 in memory_manager.allocate_counts
