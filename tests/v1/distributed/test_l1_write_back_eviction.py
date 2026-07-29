@@ -71,7 +71,10 @@ class FakeSyncStoreAdapter:
         self.result: tuple[bool, int, int] | None = None
 
     def store_objects_sync(
-        self, keys: list[ObjectKey], objects: list
+        self,
+        keys: list[ObjectKey],
+        objects: list,
+        timeout: float | None = None,
     ) -> tuple[bool, int, int]:
         self.stored_batches.append(list(keys))
         if self.result is not None:
@@ -85,10 +88,11 @@ class BlockingSyncStoreAdapter(FakeSyncStoreAdapter):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def store_objects_sync(self, keys, objects):
+    def store_objects_sync(self, keys, objects, timeout=None):
         self.entered.set()
-        assert self.release.wait(timeout=5.0)
-        return super().store_objects_sync(keys, objects)
+        if not self.release.wait(timeout=timeout or 5.0):
+            return False, 0, 0
+        return super().store_objects_sync(keys, objects, timeout=timeout)
 
 
 @pytest.fixture
@@ -286,6 +290,7 @@ class TestEmergencyEvict:
         assert adapter.stored_batches
         evicted = [k for batch in adapter.stored_batches for k in batch]
         assert set(evicted) <= set(keys)
+        assert len(evicted) < len(keys)
         # Evicted keys are gone from L1.
         assert not set(evicted) & set(_readable_keys(l1_manager, keys))
 
@@ -298,6 +303,39 @@ class TestEmergencyEvict:
         controller.emergency_evict_bytes(1024, requester="test")
 
         assert adapter.stored_batches == []
+        assert _readable_keys(l1_manager, keys) == keys
+
+    def test_emergency_evict_skips_scan_during_backoff(self, l1_manager, monkeypatch):
+        adapter = FakeSyncStoreAdapter()
+        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
+        keys = _make_keys(6)
+        _store_keys(l1_manager, keys)
+        controller._sync_flush_backoff_until = time.monotonic() + 60
+        monkeypatch.setattr(
+            controller._eviction_policy,
+            "get_eviction_actions",
+            lambda *args, **kwargs: pytest.fail("eviction scan should be skipped"),
+        )
+
+        used, total = l1_manager.get_memory_usage()
+        free = total - used
+        assert controller.emergency_evict_bytes(free + 1024) == free
+
+    def test_emergency_evict_has_bounded_store_wait(self, l1_manager):
+        adapter = BlockingSyncStoreAdapter()
+        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
+        controller._EMERGENCY_FLUSH_TIMEOUT_SECONDS = 0.05
+        keys = _make_keys(6)
+        _store_keys(l1_manager, keys)
+        used, total = l1_manager.get_memory_usage()
+
+        start = time.monotonic()
+        free_after = controller.emergency_evict_bytes(total - used + 1024)
+        elapsed = time.monotonic() - start
+
+        assert adapter.entered.is_set()
+        assert elapsed < 0.5
+        assert free_after == total - used
         assert _readable_keys(l1_manager, keys) == keys
 
 
@@ -323,6 +361,45 @@ class TestPeriodicBackupFlush:
         assert flushed <= set(keys)
         assert _readable_keys(l1_manager, keys) == keys
 
+    def test_backup_batches_rotate_without_full_snapshot(self, l1_manager):
+        adapter = FakeSyncStoreAdapter()
+        controller = _make_controller(l1_manager, adapter)
+        keys = _make_keys(6)
+        _store_keys(l1_manager, keys)
+
+        for _ in range(3):
+            controller._backup_to_l2_no_delete(batch_limit=2)
+
+        assert [len(batch) for batch in adapter.stored_batches] == [2, 2, 2]
+        assert {key for batch in adapter.stored_batches for key in batch} == set(keys)
+
+    def test_evictable_batch_scan_wraps_and_is_bounded(self, l1_manager):
+        keys = _make_keys(5)
+        _store_keys(l1_manager, keys)
+        assert l1_manager.reserve_read([keys[0]])[keys[0]][0] == L1Error.SUCCESS
+        try:
+            first, cursor = l1_manager.get_evictable_keys(
+                limit=2,
+                cursor=0,
+                scan_limit=2,
+            )
+            second, cursor = l1_manager.get_evictable_keys(
+                limit=2,
+                cursor=cursor,
+                scan_limit=2,
+            )
+            third, _ = l1_manager.get_evictable_keys(
+                limit=2,
+                cursor=cursor,
+                scan_limit=2,
+            )
+        finally:
+            l1_manager.finish_read([keys[0]])
+
+        assert first == [keys[1]]
+        assert second == keys[2:4]
+        assert third == [keys[4]]
+
 
 class _RecordingEvictor:
     """Eviction-controller double recording emergency_evict_bytes calls."""
@@ -335,13 +412,18 @@ class _RecordingEvictor:
         return target_free_bytes
 
 
-def _make_prefetch_controller(l1_manager: L1Manager) -> PrefetchController:
-    return PrefetchController(
+@pytest.fixture
+def prefetch_controller(l1_manager: L1Manager) -> Iterator[PrefetchController]:
+    controller = PrefetchController(
         l1_manager=l1_manager,
         l2_adapters=[],
         adapter_descriptors=[],
         policy=DefaultPrefetchPolicy(),
     )
+    yield controller
+    # The loop thread was never started, so stop() cannot join it.
+    controller._submission_efd.close()
+    controller._adapter_ctrl_efd.close()
 
 
 def _make_request(keys: list[ObjectKey]) -> InFlightPrefetchRequest:
@@ -354,9 +436,9 @@ def _make_request(keys: list[ObjectKey]) -> InFlightPrefetchRequest:
 
 
 class TestPrefetchMakeRoom:
-    def test_make_room_asks_evictor_when_short(self, l1_manager):
+    def test_make_room_asks_evictor_when_short(self, l1_manager, prefetch_controller):
         """A restore that does not fit in free L1 asks for eviction."""
-        controller = _make_prefetch_controller(l1_manager)
+        controller = prefetch_controller
         evictor = _RecordingEvictor()
         controller.set_l1_eviction_controller(evictor)
         resident = _make_keys(6)
@@ -377,8 +459,8 @@ class TestPrefetchMakeRoom:
         assert target > 0
         assert "prefetch_request=7" in requester
 
-    def test_make_room_noop_when_space_available(self, l1_manager):
-        controller = _make_prefetch_controller(l1_manager)
+    def test_make_room_noop_when_space_available(self, l1_manager, prefetch_controller):
+        controller = prefetch_controller
         evictor = _RecordingEvictor()
         controller.set_l1_eviction_controller(evictor)
 
@@ -387,15 +469,38 @@ class TestPrefetchMakeRoom:
 
         assert evictor.calls == []
 
-    def test_make_room_noop_without_evictor(self, l1_manager):
-        controller = _make_prefetch_controller(l1_manager)
+    def test_make_room_noop_without_evictor(self, l1_manager, prefetch_controller):
+        controller = prefetch_controller
         keys = _make_keys(2)
 
         controller._make_room_for_restore(_make_request(keys), keys)
 
-    def test_retry_recovers_oom_reservations(self, l1_manager):
+    def test_eviction_controller_can_be_disconnected(self, prefetch_controller):
+        evictor = _RecordingEvictor()
+        prefetch_controller.set_l1_eviction_controller(evictor)
+        prefetch_controller.set_l1_eviction_controller(None)
+
+        assert prefetch_controller._l1_eviction_controller is None
+
+    def test_short_retention_policy_degrades_to_temporary(
+        self, prefetch_controller, monkeypatch
+    ):
+        keys = _make_keys(3)
+        monkeypatch.setattr(
+            prefetch_controller._policy,
+            "select_l1_retentions",
+            lambda _keys: [True],
+        )
+
+        assert prefetch_controller._select_l1_retentions(7, keys) == [
+            False,
+            False,
+            False,
+        ]
+
+    def test_retry_recovers_oom_reservations(self, l1_manager, prefetch_controller):
         """OOM reservations are retried once after emergency eviction."""
-        controller = _make_prefetch_controller(l1_manager)
+        controller = prefetch_controller
         evictor = _RecordingEvictor()
         controller.set_l1_eviction_controller(evictor)
         keys = _make_keys(2)
@@ -412,8 +517,8 @@ class TestPrefetchMakeRoom:
             assert mem_obj is not None
         l1_manager.finish_write(keys)
 
-    def test_retry_noop_when_all_reserved(self, l1_manager):
-        controller = _make_prefetch_controller(l1_manager)
+    def test_retry_noop_when_all_reserved(self, l1_manager, prefetch_controller):
+        controller = prefetch_controller
         evictor = _RecordingEvictor()
         controller.set_l1_eviction_controller(evictor)
         keys = _make_keys(2)

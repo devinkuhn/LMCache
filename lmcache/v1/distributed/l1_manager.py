@@ -5,6 +5,7 @@ Managing objects and memory for L1 cache
 
 # Standard
 from dataclasses import dataclass
+from itertools import chain, islice
 from typing import Literal
 import threading
 
@@ -794,14 +795,52 @@ class L1Manager:
         )
 
     @l1_mgr_synchronized
-    def get_evictable_keys(self) -> list[ObjectKey]:
-        """Return a snapshot of the keys currently eligible for eviction.
+    def get_evictable_keys(
+        self,
+        limit: int,
+        cursor: int = 0,
+        scan_limit: int | None = None,
+    ) -> tuple[list[ObjectKey], int]:
+        """Return a bounded, rotating batch of evictable keys.
+
+        ``cursor`` is an insertion-order offset returned by the previous call.
+        The scan wraps once and inspects at most ``scan_limit`` entries, so a
+        periodic backup cannot materialize the complete L1 keyspace while the
+        manager lock is held. Concurrent insertions or removals may shift the
+        offset, but every returned key is revalidated by ``reserve_read``.
+
+        Args:
+            limit: Maximum number of keys to return.
+            cursor: Insertion-order offset at which to resume scanning.
+            scan_limit: Maximum entries to inspect. Defaults to four batches.
 
         Returns:
-            The keys that exist and are neither read- nor write-locked, in
-            insertion order.
+            A pair of the eligible keys and the cursor for the next call.
         """
-        return [key for key in self._objects if self.is_key_evictable(key)]
+        if limit <= 0 or not self._objects:
+            return [], 0
+
+        object_count = len(self._objects)
+        start = cursor % object_count
+        max_scan = min(
+            object_count,
+            max(limit, scan_limit if scan_limit is not None else limit * 4),
+        )
+        ordered_keys = chain(
+            islice(self._objects, start, None),
+            islice(self._objects, 0, start),
+        )
+        keys: list[ObjectKey] = []
+        scanned = 0
+        for key in ordered_keys:
+            scanned += 1
+            if self.is_key_evictable(key):
+                keys.append(key)
+                if len(keys) >= limit:
+                    break
+            if scanned >= max_scan:
+                break
+        return keys, (start + scanned) % object_count
 
     @l1_mgr_synchronized
     def num_objects(self) -> int:

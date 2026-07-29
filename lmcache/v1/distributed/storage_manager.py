@@ -171,16 +171,14 @@ class StorageManager:
                     "write_back_on_evict / periodic_flush_interval is set but "
                     "no L2 adapter exposes store_objects_sync"
                 )
-        if eviction_config.emergency_evict_for_prefetch:
-            if self._eviction_controller.has_l2_flush_adapter():
-                self._prefetch_controller.set_l1_eviction_controller(
-                    self._eviction_controller
-                )
-            else:
-                logger.warning(
-                    "emergency_evict_for_prefetch has no synchronous L2 "
-                    "adapter; inactive until one is added"
-                )
+        if (
+            eviction_config.emergency_evict_for_prefetch
+            and not self._eviction_controller.has_l2_flush_adapter()
+        ):
+            logger.warning(
+                "emergency_evict_for_prefetch has no synchronous L2 "
+                "adapter; inactive until one is added"
+            )
 
         # L2 usage gauge — one observation per adapter, tagged by
         # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
@@ -1161,12 +1159,11 @@ class StorageManager:
         with self._adapters_lock:
             adapters = dict(self._l2_adapters)
         self._eviction_controller.set_l2_adapters(adapters)
-        if (
-            config.emergency_evict_for_prefetch
-            and self._eviction_controller.has_l2_flush_adapter()
-        ):
+        if config.emergency_evict_for_prefetch:
             self._prefetch_controller.set_l1_eviction_controller(
                 self._eviction_controller
+                if self._eviction_controller.has_l2_flush_adapter()
+                else None
             )
 
     def _unwrap_reconfigurable_l2_adapter(

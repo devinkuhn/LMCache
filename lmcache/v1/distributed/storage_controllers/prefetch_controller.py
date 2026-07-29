@@ -127,7 +127,7 @@ def trim_load_plan_with_mask(
 def _layout_nbytes(layout_desc: MemoryLayoutDesc) -> int:
     """Return the byte size of one object with the given layout."""
     total = 0
-    for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=False):
+    for shape, dtype in zip(layout_desc.shapes, layout_desc.dtypes, strict=True):
         numel = 1
         for dim in shape:
             numel *= int(dim)
@@ -866,6 +866,25 @@ class PrefetchController(StorageControllerInterface):
     # =========================================================================
     # Load phase
     # =========================================================================
+    def _select_l1_retentions(
+        self,
+        request_id: int,
+        keys: list[ObjectKey],
+    ) -> list[bool]:
+        """Return one retention decision per key, degrading safely on a
+        malformed policy result."""
+        retentions = self._policy.select_l1_retentions(keys)
+        if len(retentions) != len(keys):
+            logger.error(
+                "Prefetch request %d: policy returned %d retentions for "
+                "%d keys; defaulting to temporary entries",
+                request_id,
+                len(retentions),
+                len(keys),
+            )
+            return [False] * len(keys)
+        return retentions
+
     def _transition_to_load_phase(self, request: InFlightPrefetchRequest) -> None:
         """Compute load plan, reserve L1 buffers, and submit load tasks."""
         request.phase = PrefetchPhase.PLAN_AND_LOAD
@@ -918,7 +937,8 @@ class PrefetchController(StorageControllerInterface):
         if request.mode is PrefetchMode.WARM:
             retentions = [True] * len(keys_to_reserve)
         else:
-            retentions = self._policy.select_l1_retentions(
+            retentions = self._select_l1_retentions(
+                request.request_id,
                 keys_to_reserve,
             )
             # Non-WARM only: a WARM warm-up must never trigger emergency
@@ -1064,12 +1084,16 @@ class PrefetchController(StorageControllerInterface):
             len(reserved_key_set),
         )
 
-    def set_l1_eviction_controller(self, controller: "L1EvictionController") -> None:
+    def set_l1_eviction_controller(
+        self,
+        controller: "L1EvictionController | None",
+    ) -> None:
         """Enable emergency L1 eviction for large restores.
 
         With a controller injected, a non-WARM restore that would not fit
         in free L1 space synchronously evicts LRU keys (write-back first)
-        before reserving, and retries OOM reservations once.
+        before reserving, and retries OOM reservations once. Pass ``None``
+        after the last synchronous L2 adapter is removed to disable this path.
         """
         self._l1_eviction_controller = controller
 
