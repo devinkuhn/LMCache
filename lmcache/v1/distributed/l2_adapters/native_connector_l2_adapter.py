@@ -30,7 +30,7 @@ import threading
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.internal_api import L2StoreResult
+from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
@@ -153,6 +153,12 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # Bridges the async store submit → demux completion gap so the
         # demux thread can fire ``_notify_keys_stored(keys, sizes)``.
         self._pending_store_sizes: dict[int, tuple[list[ObjectKey], list[int]]] = {}
+
+        # A filesystem factory may prime durable objects before the eviction
+        # listener exists. Keep one temporary startup snapshot for that first
+        # listener; _key_sizes remains the sole long-lived key index.
+        self._startup_primed = False
+        self._startup_replay: tuple[list[ObjectKey], list[int]] | None = None
 
         # Task ID counter
         self._next_task_id: L2TaskId = 0
@@ -344,6 +350,52 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
     # ---------------------------------------------------------------
     # Status Interface
     # ---------------------------------------------------------------
+
+    def prime_existing_keys(
+        self,
+        keys: list[ObjectKey],
+        sizes: list[int],
+    ) -> None:
+        """Account durable objects discovered before adapter registration."""
+        if len(keys) != len(sizes):
+            raise ValueError("keys and sizes length mismatch")
+
+        unique: dict[ObjectKey, int] = {}
+        for key, size in zip(keys, sizes, strict=True):
+            if size <= 0:
+                raise ValueError("existing object sizes must be positive")
+            unique.setdefault(key, int(size))
+
+        primed_keys = list(unique)
+        primed_sizes = list(unique.values())
+        with self._lock:
+            if self._startup_primed:
+                raise RuntimeError("existing keys were already primed")
+            if self._listeners:
+                raise RuntimeError("existing keys must be primed before listeners")
+            self._startup_primed = True
+            self._key_sizes.update(unique)
+            self._startup_replay = (primed_keys, primed_sizes)
+
+        # No listener is registered during factory construction. This uses
+        # the common accounting implementation without retaining a second
+        # byte-accounting path in this adapter.
+        if primed_keys:
+            self._notify_keys_stored(primed_keys, primed_sizes)
+            logger.info(
+                "Startup scan primed %.2f GB in %d existing objects",
+                sum(primed_sizes) / 1e9,
+                len(primed_keys),
+            )
+
+    def register_listener(self, listener: L2AdapterListener) -> None:
+        """Register a listener and replay the one-time startup snapshot."""
+        with self._lock:
+            replay = self._startup_replay
+            self._startup_replay = None
+        if replay is not None and replay[0]:
+            listener.on_l2_keys_stored(*replay)
+        super().register_listener(listener)
 
     def report_status(self) -> dict[str, Any]:
         """Return a status dict for this native-connector L2 adapter.
