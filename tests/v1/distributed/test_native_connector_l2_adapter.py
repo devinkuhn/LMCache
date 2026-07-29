@@ -10,6 +10,7 @@ C++ IStorageConnector interface, so no Redis or C++ build is needed.
 import ctypes
 import select
 import threading
+import time
 
 # Third Party
 import pytest
@@ -56,6 +57,9 @@ class MockNativeConnector:
         self._completions: list[tuple[int, bool, str, list[bool] | None]] = []
         self._lock = threading.Lock()
         self._closed = False
+        self.report_set_per_key_results = True
+        self.fail_set_keys: set[str] = set()
+        self.suppress_set_completion = False
 
     def event_fd(self) -> int:
         return self._efd.fileno()
@@ -66,9 +70,21 @@ class MockNativeConnector:
             self._next_id += 1
 
         try:
+            results = []
             for key, mv in zip(keys, memoryviews, strict=False):
+                if key in self.fail_set_keys:
+                    results.append(False)
+                    continue
                 self._store[key] = bytes(mv)
-            self._push_completion(fid, True, "", None)
+                results.append(True)
+            ok = all(results)
+            if not self.suppress_set_completion:
+                self._push_completion(
+                    fid,
+                    ok,
+                    "" if ok else "injected set failure",
+                    results if self.report_set_per_key_results else None,
+                )
         except Exception as e:
             self._push_completion(fid, False, str(e), None)
 
@@ -200,6 +216,14 @@ def adapter():
     mock_client = MockNativeConnector()
     adp = NativeConnectorL2Adapter(mock_client)
     yield adp
+    adp.close()
+
+
+@pytest.fixture
+def adapter_and_mock():
+    mock_client = MockNativeConnector()
+    adp = NativeConnectorL2Adapter(mock_client)
+    yield adp, mock_client
     adp.close()
 
 
@@ -1358,3 +1382,136 @@ class TestUsageTracking:
         usage = adp.get_usage()
         assert usage.usage_fraction == pytest.approx(0.2)
         assert usage.total_bytes_used == 400
+
+
+# =============================================================================
+# Durable Store Tests
+# =============================================================================
+
+
+class _BlockingStoreListener:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def on_l2_keys_stored(self, keys, sizes) -> None:
+        self.entered.set()
+        assert self.release.wait(timeout=5.0)
+
+
+class TestStoreObjectsSync:
+    def test_success_uses_private_completion(self, adapter):
+        keys = [create_object_key(i) for i in range(2)]
+        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+
+        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objs)
+
+        assert ok is True
+        assert persisted == 2
+        assert bytes_written == sum(obj.get_size() for obj in objs)
+        assert adapter.get_usage().total_bytes_used == bytes_written
+        assert adapter.pop_completed_store_tasks() == {}
+
+    def test_partial_failure_accounts_only_persisted_keys(self, adapter_and_mock):
+        adapter, mock_client = adapter_and_mock
+        keys = [create_object_key(i) for i in range(2)]
+        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+        mock_client.fail_set_keys = {_object_key_to_string(keys[1])}
+
+        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objs)
+
+        assert ok is False
+        assert persisted == 1
+        assert bytes_written == objs[0].get_size()
+        assert adapter.get_usage().total_bytes_used == objs[0].get_size()
+
+    def test_async_partial_failure_uses_per_key_results(self, adapter_and_mock):
+        adapter, mock_client = adapter_and_mock
+        keys = [create_object_key(i) for i in range(2)]
+        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+        mock_client.fail_set_keys = {_object_key_to_string(keys[1])}
+
+        task_id = adapter.submit_store_task(keys, objs)
+        assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+
+        result = adapter.pop_completed_store_tasks()[task_id]
+        assert result.is_successful() is False
+        assert adapter.get_usage().total_bytes_used == objs[0].get_size()
+
+    def test_batch_fallback_without_per_key_results(self, adapter_and_mock):
+        adapter, mock_client = adapter_and_mock
+        mock_client.report_set_per_key_results = False
+        keys = [create_object_key(i) for i in range(2)]
+        objs = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+
+        ok, persisted, bytes_written = adapter.store_objects_sync(keys, objs)
+
+        assert ok is True
+        assert persisted == 2
+        assert bytes_written == sum(obj.get_size() for obj in objs)
+
+    def test_validates_inputs(self, adapter):
+        with pytest.raises(ValueError, match="length mismatch"):
+            adapter.store_objects_sync([create_object_key(1)], [])
+        with pytest.raises(ValueError, match="timeout must be positive"):
+            adapter.store_objects_sync(
+                [create_object_key(1)], [create_memory_obj()], timeout=0
+            )
+        assert adapter.store_objects_sync([], []) == (True, 0, 0)
+
+    def test_real_timeout_cleans_pending_operation(self, adapter_and_mock):
+        adapter, mock_client = adapter_and_mock
+        mock_client.suppress_set_completion = True
+
+        result = adapter.store_objects_sync(
+            [create_object_key(1)], [create_memory_obj()], timeout=0.05
+        )
+
+        assert result == (False, 0, 0)
+        assert adapter._pending_sync_store_events == {}
+        assert adapter._pending_ops == {}
+
+    def test_completion_at_timeout_waits_for_accounting(self, adapter):
+        listener = _BlockingStoreListener()
+        adapter.register_listener(listener)
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                adapter.store_objects_sync(
+                    [create_object_key(1)],
+                    [create_memory_obj()],
+                    timeout=0.05,
+                )
+            )
+        )
+        worker.start()
+        assert listener.entered.wait(timeout=5.0)
+        time.sleep(0.1)
+        assert worker.is_alive()
+
+        listener.release.set()
+        worker.join(timeout=5.0)
+
+        assert not worker.is_alive()
+        assert result[0][0] is True
+        assert adapter.get_usage().total_bytes_used == result[0][2]
+
+    def test_close_unblocks_waiter(self, adapter_and_mock):
+        adapter, mock_client = adapter_and_mock
+        mock_client.suppress_set_completion = True
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                adapter.store_objects_sync(
+                    [create_object_key(1)], [create_memory_obj()], timeout=10.0
+                )
+            )
+        )
+        worker.start()
+        time.sleep(0.05)
+
+        adapter.close()
+        worker.join(timeout=5.0)
+
+        assert not worker.is_alive()
+        assert result == [(False, 0, 0)]

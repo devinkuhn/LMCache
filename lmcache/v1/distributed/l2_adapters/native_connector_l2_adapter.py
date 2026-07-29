@@ -98,6 +98,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
     # Operation type tags for the pending-ops map
     _OP_STORE = "store"
+    _OP_SYNC_STORE = "sync_store"
     _OP_LOOKUP = "lookup"
     _OP_LOAD = "load"
     _OP_DELETE = "delete"
@@ -143,6 +144,12 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         # Pending delete events for synchronous delete() calls
         self._pending_delete_events: dict[L2TaskId, threading.Event] = {}
+
+        # Synchronous stores use private completions so StoreController cannot
+        # consume another thread's result from _completed_stores.
+        self._pending_sync_store_events: dict[
+            L2TaskId, tuple[threading.Event, dict[str, Any]]
+        ] = {}
 
         # Per-key size tracking. ``_key_sizes`` lets us look up byte sizes
         # at delete time (the native completion only carries booleans, not
@@ -218,6 +225,80 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             completed = self._completed_stores
             self._completed_stores = {}
         return completed
+
+    def store_objects_sync(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        timeout: float | None = None,
+    ) -> tuple[bool, int, int]:
+        """Persist objects and wait for their native backend completion.
+
+        Returns ``(success, persisted_count, bytes_written)``. ``success`` is
+        true only when every key persisted, while the other fields account
+        for successful keys in a partially failed batch.
+        """
+        if len(keys) != len(objects):
+            raise ValueError("keys and objects length mismatch")
+        if not keys:
+            return True, 0, 0
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
+
+        key_strings = [_object_key_to_string(key) for key in keys]
+        memviews = [_obj_to_memoryview(obj) for obj in objects]
+        per_key_sizes = [obj.get_size() for obj in objects]
+        done_event = threading.Event()
+        result: dict[str, Any] = {
+            "completed": False,
+            "ok": False,
+            "persisted_count": 0,
+            "bytes_written": 0,
+        }
+
+        with self._lock:
+            task_id = self._get_next_task_id()
+            future_id = int(self._client.submit_batch_set(key_strings, memviews))
+            self._pending_ops[future_id] = (
+                self._OP_SYNC_STORE,
+                task_id,
+                len(keys),
+                None,
+            )
+            self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
+            self._pending_sync_store_events[task_id] = (done_event, result)
+
+        wait_timeout = (
+            timeout if timeout is not None else max(30.0, min(300.0, len(keys) * 5.0))
+        )
+        if not done_event.wait(timeout=wait_timeout):
+            completion_in_progress = False
+            with self._lock:
+                completion_in_progress = bool(result["completed"])
+                if not completion_in_progress:
+                    self._pending_sync_store_events.pop(task_id, None)
+                    for fid, entry in list(self._pending_ops.items()):
+                        if entry[1] == task_id:
+                            self._pending_ops.pop(fid, None)
+                            self._pending_store_sizes.pop(fid, None)
+                            break
+            if completion_in_progress:
+                # The demux has committed the result and is finishing listener
+                # notifications before it releases this synchronous caller.
+                done_event.wait()
+            else:
+                logger.warning(
+                    "store_objects_sync() timed out after %.1fs for %d keys",
+                    wait_timeout,
+                    len(keys),
+                )
+                return False, 0, 0
+
+        return (
+            bool(result["ok"]),
+            int(result["persisted_count"]),
+            int(result["bytes_written"]),
+        )
 
     # ---------------------------------------------------------------
     # Lookup and Lock Interface
@@ -372,6 +453,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self._stop.set()
         self._demux_thread.join(timeout=5)
 
+        with self._lock:
+            sync_events = [
+                event for event, _result in self._pending_sync_store_events.values()
+            ]
+            self._pending_sync_store_events.clear()
+        for event in sync_events:
+            event.set()
+
         self._client.close()
 
         self._store_efd.close()
@@ -425,6 +514,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             # the caller unblocks and calls ``get_usage()``, the base
             # class's byte counters already reflect the deletion.
             delete_done_events: list[threading.Event] = []
+            sync_store_done_events: list[threading.Event] = []
 
             with self._lock:
                 for (
@@ -449,12 +539,30 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         lookup_keys,
                     ) = entry
 
-                    if op_type == self._OP_STORE:
+                    if op_type in (self._OP_STORE, self._OP_SYNC_STORE):
                         store_info = self._pending_store_sizes.pop(fid, None)
                         task_bytes = 0
-                        if ok and store_info is not None:
+                        persisted_count = 0
+                        completion_ok = False
+                        if store_info is not None:
                             store_keys, sizes = store_info
-                            for key, size in zip(store_keys, sizes, strict=True):
+                            if result_bools is None:
+                                stored_flags = [bool(ok)] * len(store_keys)
+                            else:
+                                stored_flags = [bool(value) for value in result_bools]
+                                if len(stored_flags) < len(store_keys):
+                                    stored_flags.extend(
+                                        [False] * (len(store_keys) - len(stored_flags))
+                                    )
+                                elif len(stored_flags) > len(store_keys):
+                                    stored_flags = stored_flags[: len(store_keys)]
+                            completion_ok = bool(ok) and all(stored_flags)
+                            for key, size, stored in zip(
+                                store_keys, sizes, stored_flags, strict=True
+                            ):
+                                if not stored:
+                                    continue
+                                persisted_count += 1
                                 # First-store wins for byte accounting:
                                 # a re-store of an existing key adds 0
                                 # bytes (the backend already holds it).
@@ -470,8 +578,22 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                 else:
                                     keys_stored.append(key)
                                     sizes_stored.append(0)
-                        self._completed_stores[task_id] = L2StoreResult(ok, task_bytes)
-                        self._store_efd.notify()
+                        if op_type == self._OP_STORE:
+                            self._completed_stores[task_id] = L2StoreResult(
+                                completion_ok, task_bytes
+                            )
+                            self._store_efd.notify()
+                        else:
+                            sync_entry = self._pending_sync_store_events.pop(
+                                task_id, None
+                            )
+                            if sync_entry is not None:
+                                sync_event, sync_result = sync_entry
+                                sync_result["completed"] = True
+                                sync_result["ok"] = completion_ok
+                                sync_result["persisted_count"] = persisted_count
+                                sync_result["bytes_written"] = task_bytes
+                                sync_store_done_events.append(sync_event)
 
                     elif op_type == self._OP_LOOKUP:
                         bitmap = Bitmap(num_keys)
@@ -527,6 +649,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 self._notify_keys_accessed(keys_accessed)
             if keys_deleted:
                 self._notify_keys_deleted(keys_deleted, sizes_deleted)
+            for evt in sync_store_done_events:
+                evt.set()
             # Unblock any synchronous ``delete()`` callers only AFTER
             # ``_notify_keys_deleted`` has updated the base class byte
             # accounting, so ``get_usage()`` never briefly reports stale
