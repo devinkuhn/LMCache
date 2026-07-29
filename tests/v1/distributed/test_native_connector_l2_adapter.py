@@ -1471,7 +1471,7 @@ class TestStoreObjectsSync:
         assert adapter._pending_sync_store_events == {}
         assert adapter._pending_ops == {}
 
-    def test_completion_at_timeout_waits_for_accounting(self, adapter):
+    def test_completion_at_timeout_does_not_wait_for_observer(self, adapter):
         listener = _BlockingStoreListener()
         adapter.register_listener(listener)
         result = []
@@ -1487,14 +1487,14 @@ class TestStoreObjectsSync:
         worker.start()
         assert listener.entered.wait(timeout=5.0)
         time.sleep(0.1)
-        assert worker.is_alive()
+        assert not worker.is_alive()
+        assert result[0][0] is True
+        assert adapter.get_usage().total_bytes_used == result[0][2]
 
         listener.release.set()
         worker.join(timeout=5.0)
 
         assert not worker.is_alive()
-        assert result[0][0] is True
-        assert adapter.get_usage().total_bytes_used == result[0][2]
 
     def test_close_unblocks_waiter(self, adapter_and_mock):
         adapter, mock_client = adapter_and_mock

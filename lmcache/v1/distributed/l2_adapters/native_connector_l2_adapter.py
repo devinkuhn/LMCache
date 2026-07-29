@@ -250,7 +250,6 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         per_key_sizes = [obj.get_size() for obj in objects]
         done_event = threading.Event()
         result: dict[str, Any] = {
-            "completed": False,
             "ok": False,
             "persisted_count": 0,
             "bytes_written": 0,
@@ -272,27 +271,19 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             timeout if timeout is not None else max(30.0, min(300.0, len(keys) * 5.0))
         )
         if not done_event.wait(timeout=wait_timeout):
-            completion_in_progress = False
             with self._lock:
-                completion_in_progress = bool(result["completed"])
-                if not completion_in_progress:
-                    self._pending_sync_store_events.pop(task_id, None)
-                    for fid, entry in list(self._pending_ops.items()):
-                        if entry[1] == task_id:
-                            self._pending_ops.pop(fid, None)
-                            self._pending_store_sizes.pop(fid, None)
-                            break
-            if completion_in_progress:
-                # The demux has committed the result and is finishing listener
-                # notifications before it releases this synchronous caller.
-                done_event.wait()
-            else:
-                logger.warning(
-                    "store_objects_sync() timed out after %.1fs for %d keys",
-                    wait_timeout,
-                    len(keys),
-                )
-                return False, 0, 0
+                self._pending_sync_store_events.pop(task_id, None)
+                for fid, entry in list(self._pending_ops.items()):
+                    if entry[1] == task_id:
+                        self._pending_ops.pop(fid, None)
+                        self._pending_store_sizes.pop(fid, None)
+                        break
+            logger.warning(
+                "store_objects_sync() timed out after %.1fs for %d keys",
+                wait_timeout,
+                len(keys),
+            )
+            return False, 0, 0
 
         return (
             bool(result["ok"]),
@@ -589,7 +580,6 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                             )
                             if sync_entry is not None:
                                 sync_event, sync_result = sync_entry
-                                sync_result["completed"] = True
                                 sync_result["ok"] = completion_ok
                                 sync_result["persisted_count"] = persisted_count
                                 sync_result["bytes_written"] = task_bytes
@@ -641,16 +631,21 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         if evt is not None:
                             delete_done_events.append(evt)
 
-            # Fire listener notifications outside the lock so a slow
-            # listener cannot stall further demux iterations.
+            # Commit byte accounting before releasing synchronous callers.
             if keys_stored:
-                self._notify_keys_stored(keys_stored, sizes_stored)
+                self._account_keys_stored(keys_stored, sizes_stored)
+            for evt in sync_store_done_events:
+                evt.set()
+
+            # Observer callbacks remain outside the lock and after synchronous
+            # durability completion. A slow observer must not defeat a caller's
+            # store timeout after persistence and accounting have committed.
+            if keys_stored:
+                self._notify_keys_stored_listeners(keys_stored, sizes_stored)
             if keys_accessed:
                 self._notify_keys_accessed(keys_accessed)
             if keys_deleted:
                 self._notify_keys_deleted(keys_deleted, sizes_deleted)
-            for evt in sync_store_done_events:
-                evt.set()
             # Unblock any synchronous ``delete()`` callers only AFTER
             # ``_notify_keys_deleted`` has updated the base class byte
             # accounting, so ``get_usage()`` never briefly reports stale
