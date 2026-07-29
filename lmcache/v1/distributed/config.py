@@ -311,6 +311,12 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         ValueError: If mutually exclusive L1 tiers are both configured, or
             hybrid L1 is paired with incompatible L2 adapters.
     """
+    eviction = config.eviction_config
+    if eviction.periodic_flush_interval < 0:
+        raise ValueError("periodic_flush_interval must be >= 0")
+    if eviction.emergency_evict_for_prefetch and not eviction.write_back_on_evict:
+        raise ValueError("emergency_evict_for_prefetch requires write_back_on_evict")
+
     if (
         config.l1_manager_config.gds_l1_config is not None
         and config.l1_manager_config.memory_config.devdax_path

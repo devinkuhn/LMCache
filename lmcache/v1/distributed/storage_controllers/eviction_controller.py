@@ -128,6 +128,11 @@ class L1EvictionController(EvictionController):
 
         self._write_back_enabled = bool(eviction_config.write_back_on_evict)
         self._l2_adapters: dict[int, L2AdapterInterface] = {}
+        self._l2_adapters_lock = threading.Lock()
+        # Serializes all synchronous L2 flushes and adapter-set replacement.
+        # StorageManager can therefore remove an adapter only after any L1
+        # writeback currently using it has finished.
+        self._flush_lock = threading.Lock()
         # Sync-flush circuit breaker: a dead L2 must not cause a
         # multi-thousand-key synchronous retry and warning storm every
         # second.
@@ -137,23 +142,48 @@ class L1EvictionController(EvictionController):
         self._backup_flush_cursor: int = 0
         # Serializes emergency evictions from concurrent callers.
         self._emergency_evict_lock = threading.Lock()
+        if self._write_back_enabled:
+            # Writeback must fail closed. Register the L2 destination even
+            # before a compatible adapter exists so policy never falls back
+            # to DISCARD when persistence is unavailable.
+            self._eviction_policy.register_eviction_destination(
+                EvictionDestination.L2_CACHE
+            )
         if l2_adapters:
             self.set_l2_adapters(l2_adapters)
 
     def set_l2_adapters(self, l2_adapters: dict[int, L2AdapterInterface]) -> None:
         """Late-inject L2 adapters after StorageManager creates them.
 
-        Registers the ``L2_CACHE`` eviction destination only when
-        ``write_back_on_evict`` is enabled; otherwise eviction keeps
-        discarding and the adapters serve the periodic backup flush only.
+        Only adapters with an explicit synchronous durability contract are
+        eligible. The L2 eviction destination itself is registered at
+        construction so enabled writeback always fails closed.
         """
-        self._l2_adapters = dict(l2_adapters)
-        if self._write_back_enabled and self._l2_adapters:
-            self._eviction_policy.register_eviction_destination(
-                EvictionDestination.L2_CACHE
+        compatible = {
+            adapter_id: adapter
+            for adapter_id, adapter in l2_adapters.items()
+            if callable(getattr(adapter, "store_objects_sync", None))
+        }
+        ignored = sorted(set(l2_adapters) - set(compatible))
+        if ignored:
+            logger.warning(
+                "L1 writeback ignored adapters without store_objects_sync: %s",
+                ignored,
             )
+        with self._flush_lock:
+            with self._l2_adapters_lock:
+                self._l2_adapters = compatible
+
+    def has_l2_flush_adapter(self) -> bool:
+        """Return whether a synchronous durability backend is available."""
+        return bool(self._snapshot_l2_adapters())
+
+    def _snapshot_l2_adapters(self) -> list[tuple[int, L2AdapterInterface]]:
+        with self._l2_adapters_lock:
+            return list(self._l2_adapters.items())
 
     def report_status(self) -> dict:
+        adapters = self._snapshot_l2_adapters()
         return {
             "is_healthy": self._thread.is_alive(),
             "thread_alive": self._thread.is_alive(),
@@ -161,7 +191,8 @@ class L1EvictionController(EvictionController):
             "trigger_watermark": self._eviction_config.trigger_watermark,
             "eviction_ratio": self._eviction_config.eviction_ratio,
             "write_back_enabled": self._write_back_enabled,
-            "l2_flush_enabled": bool(self._l2_adapters),
+            "l2_flush_enabled": bool(adapters),
+            "l2_flush_adapter_ids": [adapter_id for adapter_id, _ in adapters],
             "periodic_flush_interval": (self._eviction_config.periodic_flush_interval),
             "sync_flush_failures": self._sync_flush_failures,
             "sync_flush_backoff_seconds": max(
@@ -223,7 +254,7 @@ class L1EvictionController(EvictionController):
             if usage < watermark:
                 if (
                     backup_interval > 0
-                    and self._l2_adapters
+                    and self._snapshot_l2_adapters()
                     and time.monotonic() - self._last_backup_flush >= backup_interval
                 ):
                     self._last_backup_flush = time.monotonic()
@@ -257,7 +288,7 @@ class L1EvictionController(EvictionController):
             self._publish_triggered(usage, watermark)
 
     def execute_eviction_action(self, action: EvictionAction):
-        if action.destination == EvictionDestination.L2_CACHE and self._l2_adapters:
+        if action.destination == EvictionDestination.L2_CACHE:
             self._flush_to_l2_then_delete(action.keys)
         elif action.destination == EvictionDestination.DISCARD:
             self._l1_manager.delete(action.keys)
@@ -329,31 +360,32 @@ class L1EvictionController(EvictionController):
         batch on any partial failure. Repeated failures open the circuit
         breaker with exponential backoff.
         """
-        if not keys:
-            return
-        if time.monotonic() < self._sync_flush_backoff_until:
-            return
+        with self._flush_lock:
+            if not keys:
+                return
+            if time.monotonic() < self._sync_flush_backoff_until:
+                return
 
-        all_ok = True
-        for start in range(0, len(keys), self._SYNC_FLUSH_BATCH_SIZE):
-            batch = keys[start : start + self._SYNC_FLUSH_BATCH_SIZE]
-            if not self._flush_one_l2_batch_then_delete(batch):
-                all_ok = False
-                break
+            all_ok = True
+            for start in range(0, len(keys), self._SYNC_FLUSH_BATCH_SIZE):
+                batch = keys[start : start + self._SYNC_FLUSH_BATCH_SIZE]
+                if not self._flush_one_l2_batch_then_delete(batch):
+                    all_ok = False
+                    break
 
-        if all_ok:
-            self._sync_flush_failures = 0
-            self._sync_flush_backoff_until = 0.0
-        else:
-            self._sync_flush_failures += 1
-            delay = min(60.0, float(2 ** min(self._sync_flush_failures, 6)))
-            self._sync_flush_backoff_until = time.monotonic() + delay
-            logger.warning(
-                "L1-to-L2 flush circuit breaker: failure=%d, retry in %.0fs; "
-                "remaining L1 keys preserved",
-                self._sync_flush_failures,
-                delay,
-            )
+            if all_ok:
+                self._sync_flush_failures = 0
+                self._sync_flush_backoff_until = 0.0
+            else:
+                self._sync_flush_failures += 1
+                delay = min(60.0, float(2 ** min(self._sync_flush_failures, 6)))
+                self._sync_flush_backoff_until = time.monotonic() + delay
+                logger.warning(
+                    "L1-to-L2 flush circuit breaker: failure=%d, retry in %.0fs; "
+                    "remaining L1 keys preserved",
+                    self._sync_flush_failures,
+                    delay,
+                )
 
     def _flush_one_l2_batch_then_delete(self, keys: list[ObjectKey]) -> bool:
         """Flush one batch to L2; delete from L1 only when fully durable.
@@ -368,32 +400,30 @@ class L1EvictionController(EvictionController):
         read_result = self._l1_manager.reserve_read(keys)
         readable_keys: list[ObjectKey] = []
         readable_objs = []
-        failed_keys: list[ObjectKey] = []
-
         for key in keys:
             entry = read_result.get(key)
-            if entry is None or entry[0] != L1Error.SUCCESS or entry[1] is None:
-                failed_keys.append(key)
-            else:
+            if (
+                entry is not None
+                and entry[0] == L1Error.SUCCESS
+                and entry[1] is not None
+            ):
                 readable_keys.append(key)
                 readable_objs.append(entry[1])
 
         flushed = not readable_keys
         if readable_keys:
-            for idx, adapter in self._l2_adapters.items():
-                sync_store = getattr(adapter, "store_objects_sync", None)
-                if sync_store is None:
-                    logger.warning(
-                        "L1-to-L2 flush: adapter %d has no sync store; "
-                        "preserving %d readable keys in L1",
-                        idx,
-                        len(readable_keys),
-                    )
-                    continue
-                try:
-                    ok, persisted_count, bytes_written = sync_store(
-                        readable_keys, readable_objs
-                    )
+            try:
+                for idx, adapter in self._snapshot_l2_adapters():
+                    sync_store = adapter.store_objects_sync
+                    try:
+                        ok, persisted_count, bytes_written = sync_store(
+                            readable_keys, readable_objs
+                        )
+                    except Exception:
+                        logger.exception(
+                            "L1-to-L2 flush: sync store failed on adapter %d", idx
+                        )
+                        continue
                     # Never delete unless every readable key is durable.
                     if ok and persisted_count == len(readable_keys):
                         flushed = True
@@ -414,20 +444,14 @@ class L1EvictionController(EvictionController):
                         len(readable_keys),
                         bytes_written,
                     )
-                except Exception:
-                    logger.exception(
-                        "L1-to-L2 flush: sync store failed on adapter %d", idx
-                    )
+            finally:
+                self._l1_manager.finish_read(readable_keys)
 
-        if readable_keys:
-            self._l1_manager.finish_read(readable_keys)
-
-        # Failed reserve_read keys are already absent or unreadable in L1.
-        # Readable keys are deleted only after complete L2 persistence.
-        keys_to_delete = list(failed_keys)
-        if flushed:
-            keys_to_delete.extend(readable_keys)
-        elif readable_keys:
+        # Only keys we read and then fully persisted may be deleted. A key
+        # that failed reserve_read can have become locked after candidate
+        # selection and must never be treated as absent.
+        keys_to_delete = list(readable_keys) if flushed else []
+        if not flushed and readable_keys:
             logger.warning(
                 "L1-to-L2 flush: preserving %d readable keys after failed persist",
                 len(readable_keys),
@@ -453,6 +477,11 @@ class L1EvictionController(EvictionController):
         insertion-ordered keys forever. Adapters skip keys they already
         hold, so the flush is idempotent.
         """
+        with self._flush_lock:
+            self._backup_to_l2_no_delete_locked(batch_limit)
+
+    def _backup_to_l2_no_delete_locked(self, batch_limit: int) -> None:
+        """Implementation of periodic backup under ``_flush_lock``."""
         evictable_keys = self._l1_manager.get_evictable_keys()
         if not evictable_keys:
             return
@@ -480,19 +509,18 @@ class L1EvictionController(EvictionController):
 
         total_persisted = 0
         total_bytes = 0
-        for idx, adapter in self._l2_adapters.items():
-            sync_store = getattr(adapter, "store_objects_sync", None)
-            if sync_store is None:
-                continue
-            try:
-                ok, persisted, written = sync_store(readable_keys, readable_objs)
-                if ok:
-                    total_persisted += persisted
-                    total_bytes += written
-            except Exception:
-                logger.exception("Periodic L2 backup: sync store failed on %d", idx)
-
-        self._l1_manager.finish_read(readable_keys)
+        try:
+            for idx, adapter in self._snapshot_l2_adapters():
+                sync_store = adapter.store_objects_sync
+                try:
+                    ok, persisted, written = sync_store(readable_keys, readable_objs)
+                    if ok:
+                        total_persisted += persisted
+                        total_bytes += written
+                except Exception:
+                    logger.exception("Periodic L2 backup: sync store failed on %d", idx)
+        finally:
+            self._l1_manager.finish_read(readable_keys)
 
         if total_bytes > 0:
             logger.info(

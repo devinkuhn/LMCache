@@ -14,6 +14,7 @@ Uses the CPU shared-memory allocator; no GPU required.
 # Standard
 from collections.abc import Iterator
 import argparse
+import threading
 import time
 
 # Third Party
@@ -26,6 +27,7 @@ from lmcache.v1.distributed.config import (
     EvictionConfig,
     L1ManagerConfig,
     L1MemoryManagerConfig,
+    StorageManagerConfig,
     add_storage_manager_args,
     parse_args_to_config,
 )
@@ -75,6 +77,18 @@ class FakeSyncStoreAdapter:
         if self.result is not None:
             return self.result
         return True, len(keys), sum(obj.get_size() for obj in objects)
+
+
+class BlockingSyncStoreAdapter(FakeSyncStoreAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def store_objects_sync(self, keys, objects):
+        self.entered.set()
+        assert self.release.wait(timeout=5.0)
+        return super().store_objects_sync(keys, objects)
 
 
 @pytest.fixture
@@ -183,6 +197,74 @@ class TestWriteBackOnEvict:
         )
 
         assert _readable_keys(l1_manager, keys) == keys
+
+    def test_missing_sync_adapter_fails_closed(self, l1_manager):
+        config = EvictionConfig(eviction_policy="LRU", write_back_on_evict=True)
+        controller = L1EvictionController(
+            l1_manager=l1_manager,
+            eviction_config=config,
+            l2_adapters={0: object()},
+        )
+        keys = _make_keys(2)
+        _store_keys(l1_manager, keys)
+
+        controller.execute_eviction_action(
+            EvictionAction(keys=keys, destination=EvictionDestination.L2_CACHE)
+        )
+
+        assert controller.has_l2_flush_adapter() is False
+        assert _readable_keys(l1_manager, keys) == keys
+
+    def test_reserve_read_failure_is_not_deleted(self, l1_manager, monkeypatch):
+        adapter = FakeSyncStoreAdapter()
+        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
+        keys = _make_keys(1)
+        _store_keys(l1_manager, keys)
+        monkeypatch.setattr(
+            l1_manager,
+            "reserve_read",
+            lambda _keys: {keys[0]: (L1Error.KEY_IS_LOCKED, None)},
+        )
+
+        controller.execute_eviction_action(
+            EvictionAction(keys=keys, destination=EvictionDestination.L2_CACHE)
+        )
+
+        monkeypatch.undo()
+        assert adapter.stored_batches == []
+        assert _readable_keys(l1_manager, keys) == keys
+
+    def test_adapter_replacement_waits_for_active_flush(self, l1_manager):
+        adapter = BlockingSyncStoreAdapter()
+        controller = _make_controller(l1_manager, adapter, write_back_on_evict=True)
+        keys = _make_keys(1)
+        _store_keys(l1_manager, keys)
+        flush = threading.Thread(
+            target=lambda: controller.execute_eviction_action(
+                EvictionAction(keys=keys, destination=EvictionDestination.L2_CACHE)
+            )
+        )
+        replaced = threading.Event()
+        replace = threading.Thread(
+            target=lambda: (
+                controller.set_l2_adapters({}),
+                replaced.set(),
+            )
+        )
+
+        flush.start()
+        assert adapter.entered.wait(timeout=5.0)
+        replace.start()
+        time.sleep(0.05)
+        assert not replaced.is_set()
+
+        adapter.release.set()
+        flush.join(timeout=5.0)
+        replace.join(timeout=5.0)
+
+        assert replaced.is_set()
+        assert not flush.is_alive()
+        assert not replace.is_alive()
 
 
 class TestEmergencyEvict:
@@ -377,3 +459,28 @@ class TestConfigPlumbing:
         assert config.eviction_config.write_back_on_evict is False
         assert config.eviction_config.periodic_flush_interval == 0.0
         assert config.eviction_config.emergency_evict_for_prefetch is False
+
+    @pytest.mark.parametrize(
+        "eviction_config",
+        [
+            EvictionConfig(
+                eviction_policy="LRU",
+                periodic_flush_interval=-1.0,
+            ),
+            EvictionConfig(
+                eviction_policy="LRU",
+                emergency_evict_for_prefetch=True,
+            ),
+        ],
+    )
+    def test_invalid_writeback_config_is_rejected(self, eviction_config):
+        with pytest.raises(ValueError):
+            StorageManagerConfig(
+                l1_manager_config=L1ManagerConfig(
+                    memory_config=L1MemoryManagerConfig(
+                        size_in_bytes=POOL_BYTES,
+                        use_lazy=False,
+                    )
+                ),
+                eviction_config=eviction_config,
+            )
