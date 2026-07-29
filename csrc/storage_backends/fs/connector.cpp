@@ -186,7 +186,11 @@ void FSConnector::do_single_get(WorkerFSConn& conn, const std::string& key,
   int flags = O_RDONLY;
   bool do_odirect = conn.use_odirect;
   if (do_odirect) {
-    if (odirect_eligible(buf, len, conn.disk_block_size)) {
+    const bool split_aligned = conn.disk_block_size > 0 &&
+                               (conn.read_ahead_size == 0 ||
+                                len <= conn.read_ahead_size ||
+                                conn.read_ahead_size % conn.disk_block_size == 0);
+    if (odirect_eligible(buf, len, conn.disk_block_size) && split_aligned) {
 #ifdef O_DIRECT
       flags |= O_DIRECT;
 #endif
