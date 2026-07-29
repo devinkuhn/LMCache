@@ -835,8 +835,7 @@ def test_raising_retrieve_future_contained_as_failure(fake_adapter) -> None:
 
 
 def test_successful_retrieve_marks_no_blocks_invalid(fake_adapter) -> None:
-    """With the fault-inject env unset, a successful retrieve reports no
-    load errors (also pins the hook's default-off behavior)."""
+    """A successful retrieve reports no load errors."""
     adapter, _send_mock, _ = fake_adapter
     adapter.retrieve_futures["req-1"] = (_finished_retrieve_future(True), [1, 2])
 
@@ -845,19 +844,3 @@ def test_successful_retrieve_marks_no_blocks_invalid(fake_adapter) -> None:
     assert finished_retrieves == {"req-1"}
     assert adapter.get_block_ids_with_load_errors() == set()
     assert adapter.retrieve_failure_count == 0
-
-
-def test_fault_inject_retrieve_flips_healthy_result(fake_adapter, monkeypatch) -> None:
-    """``LMCACHE_FAULT_INJECT_RETRIEVE=1.0`` deterministically turns a
-    healthy retrieve into a failure: the test hook for exercising the
-    KV-load-failure recompute path end to end."""
-    _adapter, _send_mock, _ = fake_adapter
-    monkeypatch.setenv("LMCACHE_FAULT_INJECT_RETRIEVE", "1.0")
-    adapter = _make_worker_adapter()
-    adapter.retrieve_futures["req-1"] = (_finished_retrieve_future(True), [9])
-
-    _ret_stores, finished_retrieves = adapter.get_finished(set())
-
-    assert finished_retrieves == {"req-1"}
-    assert adapter.get_block_ids_with_load_errors() == {9}
-    assert adapter.retrieve_failure_count == 1

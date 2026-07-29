@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, NoReturn, Protocol
 import enum
 import os
-import random
 import threading
 import uuid
 
@@ -1180,16 +1179,6 @@ class LMCacheMPWorkerAdapter:
         # Total failed retrieves on this worker, for log-based diagnostics.
         self.retrieve_failure_count: int = 0
 
-        # Test-only hook: flip healthy retrieve results to failures with
-        # the given probability. This is the deterministic way to exercise
-        # the KV-load-failure recompute path end to end. Default off.
-        try:
-            self._fault_inject_retrieve_prob = float(
-                os.environ.get("LMCACHE_FAULT_INJECT_RETRIEVE", "0") or 0
-            )
-        except ValueError:
-            self._fault_inject_retrieve_prob = 0.0
-
         # Retrieve request ids dropped by the unhealthy early-return of
         # submit_retrieve_request. get_finished must still report each id
         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
@@ -1733,16 +1722,6 @@ class LMCacheMPWorkerAdapter:
                     "-- treating as failed retrieve.",
                     request_id,
                     exc,
-                )
-                r_result = False
-            if (
-                r_result
-                and self._fault_inject_retrieve_prob > 0.0
-                and random.random() < self._fault_inject_retrieve_prob
-            ):
-                logger.warning(
-                    "Fault injection: forcing retrieve failure for request_id=%s",
-                    request_id,
                 )
                 r_result = False
             finished_retrieves.add(request_id)
