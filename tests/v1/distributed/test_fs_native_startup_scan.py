@@ -4,6 +4,9 @@
 # Standard
 import os
 
+# Third Party
+import pytest
+
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
@@ -55,3 +58,21 @@ def test_scan_skips_foreign_empty_and_temporary_files(tmp_path):
 
 def test_scan_missing_directory_returns_empty(tmp_path):
     assert _scan_existing_fs_native_files(str(tmp_path / "missing")) == ([], [])
+
+
+def test_scan_fails_closed_when_existing_file_cannot_be_inspected(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "broken.data"
+    path.write_bytes(b"x")
+    original_stat = type(path).stat
+
+    def fail_data_stat(self, *args, **kwargs):
+        if self == path:
+            raise OSError("injected stat failure")
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(path), "stat", fail_data_stat)
+
+    with pytest.raises(RuntimeError, match="Could not inspect cache file"):
+        _scan_existing_fs_native_files(str(tmp_path))

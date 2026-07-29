@@ -208,7 +208,10 @@ def _scan_existing_fs_native_files(
                 continue
             entries.append((stat.st_mtime_ns, path.name, key, stat.st_size))
         except OSError as exc:
-            logger.warning("Could not inspect cache file %s: %s", path, exc)
+            # Silently omitting a durable object would under-report usage and
+            # seed an incomplete eviction index. Fail adapter construction so
+            # the operator can repair the directory or retry the startup scan.
+            raise RuntimeError(f"Could not inspect cache file {path}: {exc}") from exc
 
     entries.sort(key=lambda entry: (entry[0], entry[1]))
     return (
