@@ -337,6 +337,9 @@ class TestEmergencyEvict:
         assert elapsed < 0.5
         assert free_after == total - used
         assert _readable_keys(l1_manager, keys) == keys
+        status = controller.report_status()
+        assert status["sync_flush_failures"] == 0
+        assert status["sync_flush_backoff_seconds"] == 0.0
 
 
 class TestPeriodicBackupFlush:
@@ -372,6 +375,21 @@ class TestPeriodicBackupFlush:
 
         assert [len(batch) for batch in adapter.stored_batches] == [2, 2, 2]
         assert {key for batch in adapter.stored_batches for key in batch} == set(keys)
+
+    def test_backup_flush_has_bounded_store_wait(self, l1_manager):
+        adapter = BlockingSyncStoreAdapter()
+        controller = _make_controller(l1_manager, adapter)
+        controller._PERIODIC_FLUSH_TIMEOUT_SECONDS = 0.05
+        keys = _make_keys(2)
+        _store_keys(l1_manager, keys)
+
+        start = time.monotonic()
+        controller._backup_to_l2_no_delete(batch_limit=2)
+        elapsed = time.monotonic() - start
+
+        assert adapter.entered.is_set()
+        assert elapsed < 0.5
+        assert _readable_keys(l1_manager, keys) == keys
 
     def test_evictable_batch_scan_wraps_and_is_bounded(self, l1_manager):
         keys = _make_keys(5)
