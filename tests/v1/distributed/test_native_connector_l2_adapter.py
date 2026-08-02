@@ -1383,6 +1383,77 @@ class TestUsageTracking:
         assert usage.usage_fraction == pytest.approx(0.2)
         assert usage.total_bytes_used == 400
 
+    def test_inflight_stores_cannot_exceed_capacity(self):
+        mock_client = MockNativeConnector()
+        mock_client.suppress_set_completion = True
+        capacity = 800
+        adp = NativeConnectorL2Adapter(
+            mock_client,
+            max_capacity_gb=capacity / (1024**3),
+        )
+        try:
+            obj = create_memory_obj(size=100)  # 400 bytes
+            first = adp.submit_store_task([create_object_key(1)], [obj])
+            second = adp.submit_store_task([create_object_key(2)], [obj])
+            rejected = adp.submit_store_task([create_object_key(3)], [obj])
+
+            assert first != second != rejected
+            assert sum(len(value) for value in mock_client._store.values()) == capacity
+            assert adp.get_reserved_store_bytes() == capacity
+            assert wait_for_event_fd(adp.get_store_event_fd(), timeout=1.0)
+            result = adp.pop_completed_store_tasks()[rejected]
+            assert result.is_successful() is False
+            assert result.bytes_transferred() == 0
+        finally:
+            adp.close()
+
+    def test_failed_store_releases_capacity_reservation(self):
+        mock_client = MockNativeConnector()
+        capacity = 400
+        adp = NativeConnectorL2Adapter(
+            mock_client,
+            max_capacity_gb=capacity / (1024**3),
+        )
+        try:
+            first_key = create_object_key(1)
+            mock_client.fail_set_keys = {_object_key_to_string(first_key)}
+            first = adp.submit_store_task([first_key], [create_memory_obj(size=100)])
+            assert wait_for_event_fd(adp.get_store_event_fd(), timeout=1.0)
+            assert adp.pop_completed_store_tasks()[first].is_successful() is False
+            assert adp.get_reserved_store_bytes() == 0
+
+            mock_client.fail_set_keys.clear()
+            second = adp.submit_store_task(
+                [create_object_key(2)], [create_memory_obj(size=100)]
+            )
+            assert wait_for_event_fd(adp.get_store_event_fd(), timeout=1.0)
+            assert adp.pop_completed_store_tasks()[second].is_successful() is True
+            assert adp.get_usage().total_bytes_used == capacity
+        finally:
+            adp.close()
+
+    def test_synchronous_store_respects_capacity(self):
+        mock_client = MockNativeConnector()
+        capacity = 400
+        adp = NativeConnectorL2Adapter(
+            mock_client,
+            max_capacity_gb=capacity / (1024**3),
+        )
+        try:
+            first = adp.store_objects_sync(
+                [create_object_key(1)], [create_memory_obj(size=100)]
+            )
+            rejected = adp.store_objects_sync(
+                [create_object_key(2)], [create_memory_obj(size=100)]
+            )
+
+            assert first == (True, 1, capacity)
+            assert rejected == (False, 0, 0)
+            assert len(mock_client._store) == 1
+            assert adp.get_usage().total_bytes_used == capacity
+        finally:
+            adp.close()
+
 
 # =============================================================================
 # Durable Store Tests
@@ -1459,7 +1530,7 @@ class TestStoreObjectsSync:
             )
         assert adapter.store_objects_sync([], []) == (True, 0, 0)
 
-    def test_real_timeout_cleans_pending_operation(self, adapter_and_mock):
+    def test_real_timeout_keeps_pending_operation_reserved(self, adapter_and_mock):
         adapter, mock_client = adapter_and_mock
         mock_client.suppress_set_completion = True
 
@@ -1469,7 +1540,8 @@ class TestStoreObjectsSync:
 
         assert result == (False, 0, 0)
         assert adapter._pending_sync_store_events == {}
-        assert adapter._pending_ops == {}
+        assert len(adapter._pending_ops) == 1
+        assert adapter.get_reserved_store_bytes() == create_memory_obj().get_size()
 
     def test_completion_at_timeout_does_not_wait_for_observer(self, adapter):
         listener = _BlockingStoreListener()

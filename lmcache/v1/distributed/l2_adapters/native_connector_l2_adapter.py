@@ -156,10 +156,13 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # sizes) so we can pass them to ``_notify_keys_deleted``. Aggregate
         # and per-user totals live in the base class — see ``get_usage``.
         self._key_sizes: dict[ObjectKey, int] = {}
-        # Pending store sizes: native future_id -> (keys, per_key_sizes).
+        # Pending store sizes:
+        #   native future_id -> (keys, per_key_sizes, reserved_bytes).
         # Bridges the async store submit → demux completion gap so the
         # demux thread can fire ``_notify_keys_stored(keys, sizes)``.
-        self._pending_store_sizes: dict[int, tuple[list[ObjectKey], list[int]]] = {}
+        self._pending_store_sizes: dict[
+            int, tuple[list[ObjectKey], list[int], int]
+        ] = {}
 
         # Task ID counter
         self._next_task_id: L2TaskId = 0
@@ -201,20 +204,39 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         key_strings = [_object_key_to_string(k) for k in keys]
         memviews = [_obj_to_memoryview(obj) for obj in objects]
         per_key_sizes = [obj.get_size() for obj in objects]
+        reserved_bytes = sum(per_key_sizes)
 
         # Register pending op BEFORE submit to avoid race
         # with demux thread. The native submit is
         # non-blocking so holding the lock is brief.
         with self._lock:
             task_id = self._get_next_task_id()
-            future_id = int(self._client.submit_batch_set(key_strings, memviews))
+            if not self._try_reserve_store_bytes(reserved_bytes):
+                self._completed_stores[task_id] = L2StoreResult(False, 0)
+                self._store_efd.notify()
+                logger.warning(
+                    "Rejected native L2 store of %d bytes: capacity would "
+                    "exceed %d bytes",
+                    reserved_bytes,
+                    self._max_capacity_bytes,
+                )
+                return task_id
+            try:
+                future_id = int(self._client.submit_batch_set(key_strings, memviews))
+            except Exception:
+                self._release_store_reservation(reserved_bytes)
+                raise
             self._pending_ops[future_id] = (
                 self._OP_STORE,
                 task_id,
                 len(keys),
                 None,
             )
-            self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
+            self._pending_store_sizes[future_id] = (
+                list(keys),
+                per_key_sizes,
+                reserved_bytes,
+            )
 
         return task_id
 
@@ -248,6 +270,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         key_strings = [_object_key_to_string(key) for key in keys]
         memviews = [_obj_to_memoryview(obj) for obj in objects]
         per_key_sizes = [obj.get_size() for obj in objects]
+        reserved_bytes = sum(per_key_sizes)
         done_event = threading.Event()
         result: dict[str, Any] = {
             "ok": False,
@@ -257,14 +280,30 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         with self._lock:
             task_id = self._get_next_task_id()
-            future_id = int(self._client.submit_batch_set(key_strings, memviews))
+            if not self._try_reserve_store_bytes(reserved_bytes):
+                logger.warning(
+                    "Rejected synchronous native L2 store of %d bytes: "
+                    "capacity would exceed %d bytes",
+                    reserved_bytes,
+                    self._max_capacity_bytes,
+                )
+                return False, 0, 0
+            try:
+                future_id = int(self._client.submit_batch_set(key_strings, memviews))
+            except Exception:
+                self._release_store_reservation(reserved_bytes)
+                raise
             self._pending_ops[future_id] = (
                 self._OP_SYNC_STORE,
                 task_id,
                 len(keys),
                 None,
             )
-            self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
+            self._pending_store_sizes[future_id] = (
+                list(keys),
+                per_key_sizes,
+                reserved_bytes,
+            )
             self._pending_sync_store_events[task_id] = (done_event, result)
 
         wait_timeout = (
@@ -273,11 +312,6 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         if not done_event.wait(timeout=wait_timeout):
             with self._lock:
                 self._pending_sync_store_events.pop(task_id, None)
-                for fid, entry in list(self._pending_ops.items()):
-                    if entry[1] == task_id:
-                        self._pending_ops.pop(fid, None)
-                        self._pending_store_sizes.pop(fid, None)
-                        break
             logger.warning(
                 "store_objects_sync() timed out after %.1fs for %d keys",
                 wait_timeout,
@@ -432,6 +466,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         status: dict[str, Any] = {
             "is_healthy": (self._demux_thread.is_alive() and not self._stop.is_set()),
             "type": self._type_name,
+            "reserved_store_bytes": self.get_reserved_store_bytes(),
         }
         status.update(self._extra_status)
         return status
@@ -449,6 +484,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 event for event, _result in self._pending_sync_store_events.values()
             ]
             self._pending_sync_store_events.clear()
+            abandoned_reservations = sum(
+                reserved_bytes
+                for _keys, _sizes, reserved_bytes in self._pending_store_sizes.values()
+            )
+            self._pending_store_sizes.clear()
+            self._pending_ops.clear()
+        if abandoned_reservations:
+            self._release_store_reservation(abandoned_reservations)
         for event in sync_events:
             event.set()
 
@@ -500,6 +543,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             keys_accessed: list[ObjectKey] = []
             keys_deleted: list[ObjectKey] = []
             sizes_deleted: list[int] = []
+            settled_store_reservations = 0
             # Events for synchronous ``delete()`` callers. We set these
             # AFTER firing ``_notify_keys_deleted`` below so that when
             # the caller unblocks and calls ``get_usage()``, the base
@@ -536,7 +580,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         persisted_count = 0
                         completion_ok = False
                         if store_info is not None:
-                            store_keys, sizes = store_info
+                            store_keys, sizes, reserved_bytes = store_info
+                            settled_store_reservations += reserved_bytes
                             if result_bools is None:
                                 stored_flags = [bool(ok)] * len(store_keys)
                             else:
@@ -631,9 +676,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         if evt is not None:
                             delete_done_events.append(evt)
 
-            # Commit byte accounting before releasing synchronous callers.
-            if keys_stored:
-                self._account_keys_stored(keys_stored, sizes_stored)
+            # Release in-flight reservations and commit durable-byte
+            # accounting in one critical section before waking callers.
+            if settled_store_reservations or keys_stored:
+                self._settle_store_reservation(
+                    settled_store_reservations,
+                    keys_stored,
+                    sizes_stored,
+                )
             for evt in sync_store_done_events:
                 evt.set()
 
