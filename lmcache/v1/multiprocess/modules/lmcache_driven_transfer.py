@@ -881,13 +881,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             separate_object_groups=self._ctx.separate_object_groups,
             full_sw_kv=self._ctx.full_sw_kv,
         )
-        layout_desc = get_layout_desc(
-            cache_context, self._ctx.chunk_size, object_group_id=0
-        )
         kv_groups_manager = cache_context.kv_layer_groups_manager
+        layout_descs = tuple(
+            get_layout_desc(
+                cache_context,
+                self._ctx.chunk_size,
+                object_group_id=object_group_id,
+            )
+            for object_group_id in range(kv_groups_manager.num_object_groups)
+        )
         attn_desc = kv_groups_manager.get_attn_desc()
         self._ctx.layout_desc_registry.register(
-            model_name, world_size, layout_desc, attn_desc
+            model_name, world_size, layout_descs, attn_desc
         )
 
         with self._lock:

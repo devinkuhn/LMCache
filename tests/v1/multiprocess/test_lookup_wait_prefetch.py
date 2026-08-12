@@ -43,7 +43,7 @@ def test_wait_prefetch_status_returns_count_and_consumes_job():
     ctx = _make_ctx(wait_result=True, found=found)
     module = _make_module(ctx)
     module._prefetch_jobs["req"] = _PrefetchJob(
-        handle=mock.sentinel.handle,
+        handles=(mock.sentinel.handle,),
         world_size=2,
         request_id="req",
         requested_tokens=512,
@@ -63,7 +63,7 @@ def test_wait_prefetch_status_timeout_returns_none_and_keeps_job():
     ctx = _make_ctx(wait_result=False)
     module = _make_module(ctx)
     job = _PrefetchJob(
-        handle=mock.sentinel.handle,
+        handles=(mock.sentinel.handle,),
         world_size=1,
         request_id="req",
         requested_tokens=0,
@@ -79,3 +79,44 @@ def test_wait_prefetch_status_timeout_returns_none_and_keeps_job():
 def test_wait_prefetch_status_unknown_request_returns_zero():
     module = _make_module(_make_ctx())
     assert module.wait_prefetch_status("missing", timeout=1.0) == 0
+
+
+def test_hybrid_status_retains_results_and_releases_surplus_group_hits():
+    """Polling consumes each group once and retains only their common prefix."""
+    first_group = mock.Mock()
+    first_group.count_leading_ones.return_value = 3
+    first_group.get_indices_list.return_value = [0, 1, 2]
+    second_group = mock.Mock()
+    second_group.count_leading_ones.return_value = 2
+    second_group.get_indices_list.return_value = [0, 1]
+
+    ctx = _make_ctx()
+    ctx.storage_manager.query_prefetch_status.side_effect = [
+        first_group,
+        None,
+        second_group,
+    ]
+    module = _make_module(ctx)
+    first_keys = tuple(mock.Mock(name=f"g0-{index}") for index in range(3))
+    second_keys = tuple(mock.Mock(name=f"g1-{index}") for index in range(3))
+    module._prefetch_jobs["req"] = _PrefetchJob(
+        handles=(mock.sentinel.group_0_handle, mock.sentinel.group_1_handle),
+        world_size=1,
+        request_id="req",
+        requested_tokens=768,
+        object_keys_by_group=(first_keys, second_keys),
+        extra_count=2,
+    )
+
+    assert module.query_prefetch_status("req") is None
+    assert module.query_prefetch_status("req") == 2
+
+    assert ctx.storage_manager.query_prefetch_status.call_args_list == [
+        mock.call(mock.sentinel.group_0_handle),
+        mock.call(mock.sentinel.group_1_handle),
+        mock.call(mock.sentinel.group_1_handle),
+    ]
+    ctx.storage_manager.finish_read_prefetched.assert_called_once_with(
+        [first_keys[2]], extra_count=2
+    )
+    assert "req" not in module._prefetch_jobs
