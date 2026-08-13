@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "connector.h"
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -8,6 +9,8 @@
 #include <string>
 
 namespace {
+std::atomic<uint64_t> next_temp_file_id{0};
+
 // O_DIRECT requires the buffer ADDRESS to be block-aligned as well as the
 // length; a misaligned address fails the read/write with EINVAL. Buffers
 // come from Python and carry no alignment guarantee, so fall back to
@@ -246,16 +249,10 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
     return;
   }
 
-  // Determine temp file path
+  const auto tmp_dir =
+      conn.tmp_dir.empty() ? file_path.parent_path() : conn.tmp_dir;
   std::filesystem::path tmp_path;
-  if (!conn.tmp_dir.empty()) {
-    tmp_path = conn.tmp_dir / filename;
-  } else {
-    tmp_path = file_path;
-    tmp_path.replace_extension(TMP_EXT);
-  }
-
-  int flags = O_CREAT | O_WRONLY | O_TRUNC;
+  int flags = O_CREAT | O_EXCL | O_WRONLY;
   bool do_odirect = conn.use_odirect;
   if (do_odirect) {
     if (odirect_eligible(buf, len, conn.disk_block_size)) {
@@ -267,31 +264,57 @@ void FSConnector::do_single_set(WorkerFSConn& conn, const std::string& key,
     }
   }
 
-  int fd = ::open(tmp_path.c_str(), flags, 0644);
+  int fd = -1;
+  for (size_t attempt = 0; attempt < 1024; ++attempt) {
+    const uint64_t id =
+        next_temp_file_id.fetch_add(1, std::memory_order_relaxed);
+    tmp_path = tmp_dir / (filename + TMP_EXT + "." +
+                          std::to_string(static_cast<uint64_t>(::getpid())) +
+                          "." + std::to_string(id));
+    fd = ::open(tmp_path.c_str(), flags, 0644);
+    if (fd >= 0) break;
+    if (errno != EEXIST) {
+      throw std::runtime_error("open for write failed: " + tmp_path.string() +
+                               ": " + strerror(errno));
+    }
+  }
   if (fd < 0) {
-    throw std::runtime_error("open for write failed: " + tmp_path.string() +
-                             ": " + strerror(errno));
+    throw std::runtime_error("failed to allocate a unique temporary file for " +
+                             file_path.string());
   }
 
   try {
     write_all(fd, buf, len);
+    if (::close(fd) != 0) {
+      const int close_errno = errno;
+      fd = -1;
+      throw std::runtime_error("close after write failed: " +
+                               std::string(strerror(close_errno)));
+    }
+    fd = -1;
   } catch (...) {
-    ::close(fd);
-    // Clean up temp file on failure
+    if (fd >= 0) ::close(fd);
     std::filesystem::remove(tmp_path);
     throw;
   }
-  ::close(fd);
 
-  // Atomic rename: tmp -> final
-  std::error_code ec;
-  std::filesystem::rename(tmp_path, file_path, ec);
-  if (ec) {
-    // Try to clean up, but prioritize reporting the original error.
+  // A hard link publishes the completed inode without replacing an existing
+  // value. Concurrent or cross-process writers therefore never share writable
+  // storage and a reader can only observe a complete file.
+  if (::link(tmp_path.c_str(), file_path.c_str()) != 0) {
+    const int link_errno = errno;
     std::error_code remove_ec;
     std::filesystem::remove(tmp_path, remove_ec);
-    throw std::runtime_error("rename failed: " + tmp_path.string() + " -> " +
-                             file_path.string() + ": " + ec.message());
+    if (link_errno == EEXIST) return;
+    throw std::runtime_error("publish failed: " + tmp_path.string() + " -> " +
+                             file_path.string() + ": " + strerror(link_errno));
+  }
+
+  std::error_code remove_ec;
+  std::filesystem::remove(tmp_path, remove_ec);
+  if (remove_ec) {
+    fprintf(stderr, "[LMCache SET] temporary file cleanup failed: %s: %s\n",
+            tmp_path.c_str(), remove_ec.message().c_str());
   }
 }
 
