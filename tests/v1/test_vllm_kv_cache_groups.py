@@ -15,6 +15,7 @@ from lmcache.v1.multiprocess.group_view import (
     expand_engine_block_ids,
     get_engine_group_indices,
     num_engine_groups,
+    slice_block_ids_per_group,
 )
 
 # Test doubles for the vLLM KV cache spec classes. Unit tests must run
@@ -57,6 +58,7 @@ class MLAAttentionSpec:
 @dataclass
 class MambaSpec:
     block_size: int
+    mamba_cache_mode: str = "align"
 
 
 @dataclass
@@ -144,6 +146,45 @@ def test_dcp_globalizes_only_sequence_sharded_group_block_spans():
     # One local main-cache block spans 64 positions on each of four DCP
     # ranks, while every rank holds a complete 128-token indexer block.
     assert [group.tokens_per_block for group in spec] == [256, 128]
+
+
+def test_dcp_keeps_mamba_recurrent_state_block_span_local():
+    """Mamba state is replicated across DCP ranks, not sequence-sharded."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[MockKVCacheGroup(["mamba.0"], MambaSpec(block_size=16))]
+        ),
+        {"mamba.0": torch.randn(2, 16, 128, dtype=torch.bfloat16)},
+        dcp_size=4,
+    )
+
+    assert spec[0].tokens_per_block == 16
+
+
+def test_dcp_uniform_mamba_group_preserves_real_tail_destination():
+    """Chunk slicing must retain the real Mamba state after null placeholders."""
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={"mamba.0": MambaSpec(block_size=16)},
+    )
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[MockKVCacheGroup(["mamba.0"], uniform_spec)]
+        ),
+        {"mamba.0": torch.randn(2, 16, 128, dtype=torch.bfloat16)},
+        dcp_size=4,
+    )
+    allocated = {0: [0] * 47 + [7]}
+
+    sliced = slice_block_ids_per_group(
+        allocated,
+        group_tokens_per_block=[spec[0].tokens_per_block],
+        start_token_idx=0,
+        end_token_idx=48 * 16,
+    )
+
+    assert spec[0].tokens_per_block == 16
+    assert sliced == [[*([0] * 47), 7]]
 
 
 def test_dcp_partial_replication_tracks_manager_and_physical_blocks():
@@ -320,6 +361,38 @@ def test_conversion_resolves_sliding_window_size():
     assert [group.sw_size_tokens for group in spec] == [-1, 64, 128]
 
 
+def test_conversion_resolves_mamba_align_window():
+    """Align mode transfers only the newest recurrent snapshot per chunk."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["full.0"], FullAttentionSpec(block_size=16)),
+                MockKVCacheGroup(["mamba.0"], MambaSpec(block_size=16)),
+            ]
+        ),
+        _same_shape_caches(["full.0", "mamba.0"]),
+    )
+
+    assert [group.sw_size_tokens for group in spec] == [-1, 16]
+
+
+def test_conversion_mamba_non_align_is_not_windowed():
+    """Only align mode has the reusable last-state snapshot contract."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(
+                    ["mamba.0"],
+                    MambaSpec(block_size=16, mamba_cache_mode="none"),
+                )
+            ]
+        ),
+        _same_shape_caches(["mamba.0"]),
+    )
+
+    assert spec[0].sw_size_tokens == -1
+
+
 def test_conversion_ignores_full_attention_sliding_window():
     """SWA layers managed as full attention (hybrid allocator disabled) are
     not sliding window: vLLM allocates blocks for all tokens."""
@@ -376,6 +449,22 @@ def test_conversion_uniform_type_specs_resolve_per_layer():
 
     assert [group.layer_indices for group in spec] == [(0,), (1,)]
     assert [group.sw_size_tokens for group in spec] == [-1, 512]
+
+
+def test_conversion_uniform_type_specs_resolve_mamba_align_leaf():
+    """Uniform wrappers inherit the Mamba leaf's one-block state window."""
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=16,
+        kv_cache_specs={"mamba.0": MambaSpec(block_size=16)},
+    )
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[MockKVCacheGroup(["mamba.0"], uniform_spec)]
+        ),
+        _same_shape_caches(["mamba.0"]),
+    )
+
+    assert spec[0].sw_size_tokens == 16
 
 
 def test_conversion_mixed_window_layers_in_one_group_rejected():
