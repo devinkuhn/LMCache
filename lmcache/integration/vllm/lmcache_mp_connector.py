@@ -754,11 +754,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         kv_cache_config = getattr(self, "_kv_cache_config", None)
         # Must precede both group-info creation and transfer registration so
         # they see the same edited views.
-        kv_caches = apply_kv_cache_group_edits(kv_cache_config, kv_caches)
+        layout_hints = vllm_layout_hints()
+        kv_caches = apply_kv_cache_group_edits(
+            kv_cache_config, kv_caches, layout_hints=layout_hints
+        )
         engine_group_infos = create_engine_group_infos_from_vllm(
             kv_cache_config,
             kv_caches,
-            layout_hints=vllm_layout_hints(),
+            layout_hints=layout_hints,
             dcp_size=self.worker_adapter.parallel_strategy.dcp_size,
         )
         self.worker_adapter.register_kv_caches(
@@ -1399,9 +1402,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             self.scheduler_adapter.report_block_allocations(records)
 
     def _get_request_tracker(self, request_id: str) -> LMCacheMPRequestTracker:
-        assert request_id in self.request_trackers, (
-            f"Request tracker for request_id {request_id} not found. "
-        )
+        assert (
+            request_id in self.request_trackers
+        ), f"Request tracker for request_id {request_id} not found. "
         return self.request_trackers[request_id]
 
     def _get_or_create_request_tracker(
