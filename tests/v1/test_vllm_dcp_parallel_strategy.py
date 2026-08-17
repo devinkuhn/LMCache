@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+# Standard
 from types import SimpleNamespace
+from typing import Any
 
+# Third Party
 import pytest
 
+# First Party
 from lmcache.integration.vllm import lmcache_mp_connector
-from lmcache.integration.vllm.vllm_multi_process_adapter import ParallelStrategy
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPSchedulerAdapter,
+    ParallelStrategy,
 )
 from lmcache.v1.multiprocess.modules.lookup import compute_extra_count
 
@@ -80,7 +84,7 @@ def test_build_parallel_strategy_reads_dcp_size(
     ],
 )
 def test_mla_dcp_rejects_unsupported_geometry(overrides: dict[str, int]) -> None:
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "use_mla": True,
         "vllm_world_size": 8,
         "vllm_worker_id": 0,
