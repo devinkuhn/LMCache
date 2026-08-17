@@ -223,13 +223,13 @@ def create_engine_group_infos_from_vllm(
     # First Party
     from lmcache.utils import EngineType
     from lmcache.v1.gpu_connector.utils import (
+        get_num_blocks,
         normalize_and_discover_per_layer_formats,
     )
     from lmcache.v1.kv_layer_groups import (
         EXCLUDED_ENGINE_GROUP,
         group_layers_by_identity,
     )
-    from lmcache.v1.gpu_connector.utils import get_num_blocks
 
     # vLLM-specific field access (confined to this function): map each
     # registered KV tensor to its vLLM engine KV cache group index. vLLM places
