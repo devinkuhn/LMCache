@@ -13,16 +13,16 @@ import torch
 
 
 class _FakeKVLayerGroupsManager:
-    """Minimal manager stub: one full-attention object group."""
+    """Minimal manager stub with two full-attention object groups."""
 
-    num_object_groups: int = 1
+    num_object_groups: int = 2
 
     def get_attn_desc(self) -> Any:
-        """One full-attention object group."""
+        """Two full-attention object groups."""
         # First Party
         from lmcache.v1.distributed.api import AttnWindowDesc
 
-        return AttnWindowDesc(num_chunks_in_sw=[-1])
+        return AttnWindowDesc(num_chunks_in_sw=[-1, -1])
 
 
 class _FakeGPUContext:
@@ -79,9 +79,15 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
         lmcache_driven_transfer as lmcache_driven_transfer_mod,
     )
 
-    layout_desc = MemoryLayoutDesc(
-        shapes=[torch.Size([2, 16, 32])],
-        dtypes=[torch.float32],
+    layout_descs = (
+        MemoryLayoutDesc(
+            shapes=[torch.Size([2, 16, 32])],
+            dtypes=[torch.float32],
+        ),
+        MemoryLayoutDesc(
+            shapes=[torch.Size([6, 16, 64])],
+            dtypes=[torch.float16],
+        ),
     )
     ctx = MagicMock()
     ctx.chunk_size = 16
@@ -105,7 +111,7 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
         object_group_id: int = 0,
     ) -> MemoryLayoutDesc:
         """Return the shared layout descriptor used by both registrations."""
-        return layout_desc
+        return layout_descs[object_group_id]
 
     monkeypatch.setattr(
         lmcache_driven_transfer_mod,
@@ -132,11 +138,15 @@ def test_unregister_one_shared_gpu_layout_keeps_registry_until_last_instance(
     module = lmcache_driven_transfer_mod.LMCacheDrivenTransferModule(ctx)
     module.register_kv_cache(1, [], "shared-model", 1, EngineType.VLLM, {}, [])
     module.register_kv_cache(2, [], "shared-model", 1, EngineType.VLLM, {}, [])
-    assert ctx.layout_desc_registry.find("shared-model", 1) is layout_desc
+    assert ctx.layout_desc_registry.find("shared-model", 1) is layout_descs[0]
+    assert (
+        ctx.layout_desc_registry.find_object_group_layouts("shared-model", 1)
+        == layout_descs
+    )
 
     module.unregister_kv_cache(1)
 
-    assert ctx.layout_desc_registry.find("shared-model", 1) is layout_desc
+    assert ctx.layout_desc_registry.find("shared-model", 1) is layout_descs[0]
 
     module.unregister_kv_cache(2)
     assert ctx.layout_desc_registry.find("shared-model", 1) is None
@@ -157,11 +167,14 @@ def test_registry_attn_desc_roundtrip() -> None:
     from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
 
     registry = LayoutDescRegistry()
+    layouts = (_layout(), _layout())
     registry.register(
-        "m", 2, _layout(), attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 2])
+        "m", 2, layouts, attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 2])
     )
 
     assert registry.find_attn_desc("m", 2).num_chunks_in_sw == [-1, 2]
+    assert registry.find("m", 2) is layouts[0]
+    assert registry.find_object_group_layouts("m", 2) == layouts
 
 
 def test_registry_attn_desc_raises_when_unregistered() -> None:
@@ -197,7 +210,27 @@ def test_registry_windows_updated_on_reregister() -> None:
         "m", 1, _layout(), attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1])
     )
     registry.register(
-        "m", 1, _layout(), attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 4])
+        "m",
+        1,
+        (_layout(), _layout()),
+        attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 4]),
     )
 
     assert registry.find_attn_desc("m", 1).num_chunks_in_sw == [-1, 4]
+
+
+def test_registry_rejects_layout_window_count_mismatch() -> None:
+    """Every object-group attention window requires its own memory layout."""
+    # First Party
+    from lmcache.v1.distributed.api import AttnWindowDesc
+    from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
+
+    registry = LayoutDescRegistry()
+
+    with pytest.raises(ValueError, match="layout count"):
+        registry.register(
+            "m",
+            1,
+            _layout(),
+            attn_desc=AttnWindowDesc(num_chunks_in_sw=[-1, 4]),
+        )

@@ -4,8 +4,9 @@
 # Standard
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 import os
 
 # Third Party
@@ -16,7 +17,10 @@ from lmcache import torch_dev
 from lmcache.utils import EngineType, init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
+from lmcache.v1.multiprocess.custom_types import (
+    GroupLayout,
+    RegisterEngineDrivenContextPayload,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.mq import MessageQueueClient
@@ -30,7 +34,12 @@ from lmcache.v1.multiprocess.transfer_context.base import (
     gather_paged_kv_to_cpu,
     scatter_cpu_to_paged_kv,
 )
+from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
 from lmcache.v1.platform import get_device_spec, resolve_kv_wrapper_factory
+
+if TYPE_CHECKING:
+    # First Party
+    import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
@@ -40,6 +49,52 @@ logger = init_logger(__name__)
 # ``lmcache_driven``); ``auto`` reproduces the historical device-type-based
 # dispatch.
 ENV_MP_TRANSFER_MODE = "LMCACHE_MP_TRANSFER_MODE"
+
+
+def _collapse_chunks_for_single_destination(
+    chunks: list[torch.Tensor],
+    block_ids: list[int],
+    blocks_in_chunk: int,
+    blocks_per_window: int,
+) -> tuple[list[torch.Tensor], list[int]]:
+    """Keep only the newest snapshot when every chunk aliases one destination.
+
+    Mamba external hits contain null placeholders for historical states. The
+    resulting block-ID list can be ``[0, 0, ..., 0]`` even though every LMCache
+    object contains a different recurrent-state snapshot. Launching all objects
+    together races multiple H2D writes to block zero. When every chunk maps to
+    the same complete destination tuple, earlier writes are fully superseded,
+    so only the newest chunk is semantically observable.
+
+    For a windowed group, destination identity is defined by the trailing
+    ``blocks_per_window`` entries of each full ``blocks_in_chunk`` mapping.
+    Mixed, partial, or incomplete aliases are left unchanged.
+    """
+    num_chunks = len(chunks)
+    if (
+        num_chunks <= 1
+        or blocks_in_chunk < 1
+        or blocks_per_window < 1
+        or blocks_per_window > blocks_in_chunk
+        or len(block_ids) != num_chunks * blocks_in_chunk
+    ):
+        return chunks, block_ids
+
+    destinations = [
+        tuple(
+            block_ids[
+                (i + 1) * blocks_in_chunk - blocks_per_window : (i + 1)
+                * blocks_in_chunk
+            ]
+        )
+        for i in range(num_chunks)
+    ]
+    destination = destinations[0]
+    if not destination or any(ids != destination for ids in destinations[1:]):
+        return chunks, block_ids
+
+    last_start = (num_chunks - 1) * blocks_in_chunk
+    return chunks[-1:], block_ids[last_start : last_start + blocks_in_chunk]
 
 
 # Helper functions
@@ -170,6 +225,37 @@ class IPCEvent(Protocol):
 
 
 SendRequest = Callable[[MessageQueueClient, RequestType, list[object]], MessagingFuture]
+
+
+@dataclass
+class _GroupState:
+    """Worker-side per-LMCache-group transfer state (multi-group registration).
+
+    Attributes:
+        layer_names: KV cache dict keys belonging to this group, in group
+            layer order — selects the gather/scatter tensor subset.
+        engine_kv_format: Detected KV format for this group's tensors.
+        blocks_in_chunk: Paged blocks of THIS group per LMCache chunk
+            (``chunk_tokens / tokens_per_block``).
+        blocks_per_window: Paged blocks of THIS group actually stored per
+            chunk. Equals ``blocks_in_chunk`` for full-attention groups; for a
+            sliding-window group it is ``window_tokens / tokens_per_block``, so
+            only the trailing ``blocks_per_window`` blocks of each chunk are
+            gathered / scattered.
+        logical_tokens_per_block: Global scheduler-token span represented by
+            one group block ID.
+        physical_tokens_per_block: Rank-local tensor slots held by that block.
+            This can be smaller than ``logical_tokens_per_block`` under DCP.
+        layout_desc: Chunk layout for this group's objects.
+    """
+
+    layer_names: list[str]
+    engine_kv_format: "lmc_ops.EngineKVFormat"
+    blocks_in_chunk: int
+    blocks_per_window: int
+    layout_desc: MemoryLayoutDesc
+    logical_tokens_per_block: int = 0
+    physical_tokens_per_block: int = 0
 
 
 def _single_group_block_ids(block_ids: list[list[int]]) -> list[int]:
@@ -409,6 +495,7 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context: EngineDrivenContext | None = None
         self._layout_hints: LayoutHints | None = None
         self._engine_kv_format: Any = None
+        self._group_states: list[_GroupState] = []
 
     @property
     def engine_driven_context(self) -> EngineDrivenContext:
@@ -438,14 +525,36 @@ class EngineDrivenTransferContext(TransferContext):
     ) -> None:
         """Register KV caches with the non-GPU context server.
 
-        ``engine_group_infos`` is accepted to satisfy the base interface but
-        is currently a no-op: the non-GPU transfer path does not support
-        hybrid KV cache groups and rejects multi-group transfers at store /
-        retrieve time (see ``_single_group_block_ids``).
+        With multiple ``engine_group_infos`` (hybrid-KV models), each group's
+        layers are described by their own layout and gathered/scattered with
+        that group's block-id list (uniform coverage: every group stores and
+        retrieves every chunk; sliding-window groups keep only the trailing
+        window of each chunk). Works over both transports: SHM gathers into
+        server-reserved slots, pickle serializes a group-major payload.
+        Single-group registration keeps the legacy path (see
+        ``_single_group_block_ids``).
+
+        Logical tokens per block can exceed the physical slot dimension for
+        context-parallel/DCP caches. In that case block selection stays in
+        logical-token units while payload shapes use rank-local physical slots.
         """
-        # TODO: per-group compression (EngineGroupInfo.tokens_per_block vs
-        # the tensor-detected slot count, e.g. DeepSeek V4) is only handled
-        # on the CUDA path. The non-CUDA path is yet to be implemented.
+        # A heterogeneous vLLM cache can contain recurrent, MLA, and fused-K/V
+        # tensors in one registration mapping.  There is no single format that
+        # describes that mapping, and asking the format detector to infer one
+        # from the first tensor can reinterpret later tensors with the wrong
+        # geometry.  The top-level fields in the registration protocol are
+        # retained only for legacy readers; use the first explicit engine group
+        # for those fields and describe every group independently below.
+        layout_source = kv_caches
+        if len(engine_group_infos) > 1:
+            layer_names = list(kv_caches)
+            first_group_indices = engine_group_infos[0].layer_indices
+            if not first_group_indices:
+                raise ValueError("engine group 0 has no registered KV cache layers")
+            layout_source = {
+                layer_names[i]: kv_caches[layer_names[i]] for i in first_group_indices
+            }
+
         (
             block_size,
             num_layers,
@@ -453,22 +562,110 @@ class EngineDrivenTransferContext(TransferContext):
             dtype_str,
             engine_kv_format,
             kv_size,
-        ) = compute_kv_layout(kv_caches, layout_hints=layout_hints)
+        ) = compute_kv_layout(layout_source, layout_hints=layout_hints)
         self._layout_hints = layout_hints
         self._engine_kv_format = engine_kv_format
 
         # The wire field is named use_mla but only drives the object plane
         # count: single-plane (kv_size == 1) covers MLA and fused-K/V formats.
         use_mla_flag = kv_size == 1
-        shape = (
-            torch.Size([num_layers, blocks_in_chunk * block_size, hidden_dim_size])
-            if use_mla_flag
-            else torch.Size(
-                [2, num_layers, blocks_in_chunk * block_size, hidden_dim_size]
+        chunk_tokens = blocks_in_chunk * block_size
+
+        group_layouts: list[GroupLayout] = []
+        group_states: list[_GroupState] = []
+        if len(engine_group_infos) > 1:
+            layer_names = list(kv_caches)
+            for gid, group in enumerate(engine_group_infos):
+                subset = {
+                    layer_names[i]: kv_caches[layer_names[i]]
+                    for i in group.layer_indices
+                }
+                (
+                    g_block_size,
+                    g_num_layers,
+                    g_hidden,
+                    g_dtype_str,
+                    g_format,
+                    g_kv_size,
+                ) = compute_kv_layout(subset, layout_hints=layout_hints)
+                has_explicit_group_geometry = group.tokens_per_block > 0
+                tokens_per_block = (
+                    group.tokens_per_block
+                    if has_explicit_group_geometry
+                    else block_size
+                )
+                physical_block_size = (
+                    g_block_size if has_explicit_group_geometry else block_size
+                )
+                if chunk_tokens % tokens_per_block != 0:
+                    raise RuntimeError(
+                        f"group {gid} tokens_per_block={tokens_per_block} does "
+                        f"not divide the chunk size ({chunk_tokens} tokens)"
+                    )
+                # Sliding-window groups store only the trailing window of each
+                # chunk. sw_size_tokens < 0 (or >= chunk) means full attention:
+                # window == chunk, so blocks_per_window == blocks_in_chunk and
+                # everything below collapses to the full-coverage behaviour.
+                sw = group.sw_size_tokens
+                logical_window_tokens = (
+                    chunk_tokens if sw < 0 or sw >= chunk_tokens else sw
+                )
+                if logical_window_tokens % tokens_per_block != 0:
+                    raise RuntimeError(
+                        f"group {gid} sliding-window size ({logical_window_tokens} "
+                        f"tokens) is not a multiple of tokens_per_block "
+                        f"({tokens_per_block})"
+                    )
+                blocks_per_window = logical_window_tokens // tokens_per_block
+                # ``tokens_per_block`` is the logical scheduler geometry. For
+                # DCP/context-parallel caches one logical block is sharded over
+                # ranks, so the tensor's slot dimension (``g_block_size``) is
+                # smaller. The payload contains only this rank's physical shard.
+                physical_window_tokens = blocks_per_window * physical_block_size
+                g_mla = g_kv_size == 1
+                g_shape = (
+                    torch.Size([g_num_layers, physical_window_tokens, g_hidden])
+                    if g_mla
+                    else torch.Size([2, g_num_layers, physical_window_tokens, g_hidden])
+                )
+                group_layouts.append(
+                    GroupLayout(
+                        num_layers=g_num_layers,
+                        hidden_dim_size=g_hidden,
+                        dtype_str=g_dtype_str,
+                        tokens_per_block=tokens_per_block,
+                        window_tokens=physical_window_tokens,
+                    )
+                )
+                group_states.append(
+                    _GroupState(
+                        layer_names=[layer_names[i] for i in group.layer_indices],
+                        engine_kv_format=g_format,
+                        blocks_in_chunk=chunk_tokens // tokens_per_block,
+                        blocks_per_window=blocks_per_window,
+                        logical_tokens_per_block=tokens_per_block,
+                        physical_tokens_per_block=physical_block_size,
+                        layout_desc=MemoryLayoutDesc(
+                            shapes=[g_shape],
+                            dtypes=[getattr(torch, g_dtype_str)],
+                        ),
+                    )
+                )
+            # Group 0's layout doubles as the legacy top-level layout so
+            # single-group readers of the payload keep working.
+            shape = group_states[0].layout_desc.shapes[0]
+            layout_desc = MemoryLayoutDesc(
+                shapes=[shape], dtypes=group_states[0].layout_desc.dtypes
             )
-        )
-        dtype = getattr(torch, dtype_str)
-        layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        else:
+            shape = (
+                torch.Size([num_layers, chunk_tokens, hidden_dim_size])
+                if use_mla_flag
+                else torch.Size([2, num_layers, chunk_tokens, hidden_dim_size])
+            )
+            dtype = getattr(torch, dtype_str)
+            layout_desc = MemoryLayoutDesc(shapes=[shape], dtypes=[dtype])
+        self._group_states = group_states
 
         future = send_request(
             mq_client,
@@ -483,6 +680,7 @@ class EngineDrivenTransferContext(TransferContext):
                     hidden_dim_size=hidden_dim_size,
                     dtype_str=dtype_str,
                     use_mla=use_mla_flag,
+                    group_layouts=group_layouts,
                 )
             ],
         )
@@ -507,10 +705,26 @@ class EngineDrivenTransferContext(TransferContext):
         )
         supported_transfer_mode = "SHM" if shm_name and pool_size > 0 else "pickle"
         logger.info(
-            "Worker non-GPU transfer context registered (instance_id=%d, mode=%s)",
+            "Worker non-GPU transfer context registered "
+            "(instance_id=%d, mode=%s, groups=%d)",
             instance_id,
             supported_transfer_mode,
+            max(1, len(self._group_states)),
         )
+        if self._group_states:
+            logger.info(
+                "Engine-driven group geometry: %s",
+                [
+                    {
+                        "layers": len(state.layer_names),
+                        "blocks_in_chunk": state.blocks_in_chunk,
+                        "blocks_per_window": state.blocks_per_window,
+                        "logical_tokens_per_block": state.logical_tokens_per_block,
+                        "physical_tokens_per_block": state.physical_tokens_per_block,
+                    }
+                    for state in self._group_states
+                ],
+            )
 
     def submit_store(
         self,
@@ -527,6 +741,9 @@ class EngineDrivenTransferContext(TransferContext):
                 "Engine-driven transfer context is not registered. "
                 "Call register() before submit_store()."
             )
+
+        if self._group_states:
+            return self._submit_store_multigroup(key, instance_id, kv_caches, block_ids)
 
         torch_dev.synchronize()
         result = self._engine_driven_context.prepare_store(key, instance_id)
@@ -545,9 +762,10 @@ class EngineDrivenTransferContext(TransferContext):
             out=out_buffers,
             chunk_indices=chunk_indices,
         )
-        if out_buffers is not None:
-            # SHM path uses async device->CPU copies; complete them before commit.
-            torch_dev.synchronize()
+        # Gather issues async device->CPU copies on both transports (into SHM
+        # slots or into fresh buffers that commit_store serializes); complete
+        # them before commit either way.
+        torch_dev.synchronize()
         ok = self._engine_driven_context.commit_store(key, instance_id, cpu_chunks)
 
         future = MessagingFuture()
@@ -569,6 +787,11 @@ class EngineDrivenTransferContext(TransferContext):
             raise RuntimeError(
                 "Engine-driven transfer context is not registered. "
                 "Call register() before submit_retrieve()."
+            )
+
+        if self._group_states:
+            return self._submit_retrieve_multigroup(
+                key, instance_id, kv_caches, block_ids, skip_first_n_tokens
             )
 
         src_buffers = self._engine_driven_context.prepare_retrieve(key, instance_id)
@@ -593,6 +816,247 @@ class EngineDrivenTransferContext(TransferContext):
         self._engine_driven_context.commit_retrieve(key, instance_id)
 
         future: MessagingFuture[bool] = MessagingFuture()
+        future.set_result(ok)
+        return future
+
+    def _group_slots(
+        self,
+        tensors: list[torch.Tensor],
+        per_slot_group_ids: list[int],
+        gid: int,
+        chunk_indices: "list[int] | None" = None,
+    ) -> "tuple[list[torch.Tensor], list[int] | None]":
+        """Select group ``gid``'s slot tensors (and chunk indices) in order."""
+        idxs = [i for i, g in enumerate(per_slot_group_ids) if g == gid]
+        picked = [tensors[i] for i in idxs]
+        if chunk_indices is None:
+            return picked, None
+        return picked, [chunk_indices[i] for i in idxs]
+
+    @staticmethod
+    def _physical_skip_tokens(state: _GroupState, logical_skip_tokens: int) -> int:
+        """Convert a global scheduler-token skip to rank-local tensor slots."""
+        logical_block = state.logical_tokens_per_block
+        physical_block = state.physical_tokens_per_block
+        if logical_block <= 0 or physical_block <= 0:
+            # Backward-compatible state created by older callers/tests: no DCP
+            # compression metadata means token and slot counts are identical.
+            return logical_skip_tokens
+        if logical_skip_tokens % logical_block:
+            logger.error(
+                "skip_first_n_tokens (%d) is not aligned to group logical "
+                "tokens_per_block=%d; rounding down",
+                logical_skip_tokens,
+                logical_block,
+            )
+        skipped_blocks = logical_skip_tokens // logical_block
+        return skipped_blocks * physical_block
+
+    def _submit_store_multigroup(
+        self,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+    ) -> MessagingFuture:
+        """Uniform-coverage store: gather every group's chunks into its slots."""
+        ctx = self._engine_driven_context
+        assert ctx is not None
+        future: MessagingFuture[bool] = MessagingFuture()
+        if len(block_ids) != len(self._group_states):
+            raise RuntimeError(
+                f"got {len(block_ids)} block-id lists for "
+                f"{len(self._group_states)} registered groups"
+            )
+        if isinstance(ctx, EngineDrivenContextPickle):
+            return self._submit_store_multigroup_pickle(
+                ctx, key, instance_id, kv_caches, block_ids
+            )
+        torch_dev.synchronize()
+        result = ctx.prepare_store_grouped(key, instance_id)
+        if result is None:
+            future.set_result(False)
+            return future
+        tensors, chunk_indices, group_ids = result
+        if not tensors:
+            future.set_result(True)
+            return future
+        for gid, state in enumerate(self._group_states):
+            out_g, chunks_g = self._group_slots(tensors, group_ids, gid, chunk_indices)
+            if not out_g:
+                continue
+            gather_paged_kv_to_cpu(
+                {name: kv_caches[name] for name in state.layer_names},
+                block_ids[gid],
+                state.blocks_in_chunk,
+                layout_hints=self._layout_hints,
+                engine_kv_format=state.engine_kv_format,
+                out=out_g,
+                chunk_indices=chunks_g,
+                blocks_per_window=state.blocks_per_window,
+            )
+        # SHM writes are async device->CPU copies; complete them before commit.
+        torch_dev.synchronize()
+        ok = ctx.commit_store(key, instance_id, [])
+        future.set_result(ok)
+        return future
+
+    def _submit_store_multigroup_pickle(
+        self,
+        ctx: "EngineDrivenContextPickle",
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+    ) -> MessagingFuture:
+        """Uniform-coverage store over pickle: group-major serialized payload.
+
+        There are no server-reserved slots in pickle mode, so each group's
+        chunks are gathered into fresh CPU tensors and the whole
+        ``chunks[group][chunk]`` list is pickled in one COMMIT_STORE payload.
+        """
+        future: MessagingFuture[bool] = MessagingFuture()
+        torch_dev.synchronize()
+        # Handshake only: the pickle strategy reserves nothing at prepare.
+        ctx.prepare_store(key, instance_id)
+        group_chunks: list[list[torch.Tensor]] = []
+        for gid, state in enumerate(self._group_states):
+            group_chunks.append(
+                gather_paged_kv_to_cpu(
+                    {name: kv_caches[name] for name in state.layer_names},
+                    block_ids[gid],
+                    state.blocks_in_chunk,
+                    layout_hints=self._layout_hints,
+                    engine_kv_format=state.engine_kv_format,
+                    blocks_per_window=state.blocks_per_window,
+                )
+            )
+        # Gather issues async device->CPU copies; commit_store serializes the
+        # buffers immediately, so the copies must be complete first.
+        torch_dev.synchronize()
+        ok = ctx.commit_store(key, instance_id, group_chunks)
+        future.set_result(ok)
+        return future
+
+    def _submit_retrieve_multigroup_pickle(
+        self,
+        ctx: "EngineDrivenContextPickle",
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        skip_first_n_tokens: int,
+    ) -> MessagingFuture:
+        """Uniform-coverage retrieve over pickle: scatter a group-major payload."""
+        future: MessagingFuture[bool] = MessagingFuture()
+        group_chunks = ctx.prepare_retrieve_multigroup(key, instance_id)
+        if group_chunks is not None and len(group_chunks) != len(self._group_states):
+            logger.error(
+                "pickle retrieve returned %d groups for %d registered groups",
+                len(group_chunks),
+                len(self._group_states),
+            )
+            group_chunks = None
+        ok = group_chunks is not None
+        if group_chunks is not None:
+            try:
+                for gid, state in enumerate(self._group_states):
+                    chunks = group_chunks[gid]
+                    group_block_ids = block_ids[gid]
+                    if skip_first_n_tokens == 0:
+                        compact_chunks, compact_block_ids = (
+                            _collapse_chunks_for_single_destination(
+                                chunks,
+                                group_block_ids,
+                                state.blocks_in_chunk,
+                                state.blocks_per_window,
+                            )
+                        )
+                        if len(compact_chunks) != len(chunks):
+                            logger.debug(
+                                "Collapsed %d aliased retrieve chunks to the "
+                                "newest snapshot for engine group %d",
+                                len(chunks),
+                                gid,
+                            )
+                        chunks = compact_chunks
+                        group_block_ids = compact_block_ids
+                    scatter_cpu_to_paged_kv(
+                        {name: kv_caches[name] for name in state.layer_names},
+                        group_block_ids,
+                        chunks,
+                        state.blocks_in_chunk,
+                        skip_first_n_tokens=self._physical_skip_tokens(
+                            state, skip_first_n_tokens
+                        ),
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=state.engine_kv_format,
+                        blocks_per_window=state.blocks_per_window,
+                    )
+            except (RuntimeError, ValueError, TypeError, IndexError):
+                logger.exception("Failed to scatter retrieved CPU context chunks")
+                ok = False
+            torch_dev.synchronize()
+        ctx.commit_retrieve(key, instance_id)
+        future.set_result(ok)
+        return future
+
+    def _submit_retrieve_multigroup(
+        self,
+        key: Any,
+        instance_id: int,
+        kv_caches: dict[str, torch.Tensor],
+        block_ids: list[list[int]],
+        skip_first_n_tokens: int,
+    ) -> MessagingFuture:
+        """Uniform-coverage retrieve: scatter every group's chunks from its slots."""
+        ctx = self._engine_driven_context
+        assert ctx is not None
+        future: MessagingFuture[bool] = MessagingFuture()
+        if len(block_ids) != len(self._group_states):
+            raise RuntimeError(
+                f"got {len(block_ids)} block-id lists for "
+                f"{len(self._group_states)} registered groups"
+            )
+        if isinstance(ctx, EngineDrivenContextPickle):
+            return self._submit_retrieve_multigroup_pickle(
+                ctx, key, instance_id, kv_caches, block_ids, skip_first_n_tokens
+            )
+        result = ctx.prepare_retrieve_grouped(key, instance_id)
+        ok = result is not None
+        if result is not None:
+            tensors, group_ids = result
+            try:
+                for gid, state in enumerate(self._group_states):
+                    src_g, _ = self._group_slots(tensors, group_ids, gid)
+                    group_block_ids = block_ids[gid]
+                    if skip_first_n_tokens == 0:
+                        src_g, group_block_ids = (
+                            _collapse_chunks_for_single_destination(
+                                src_g,
+                                group_block_ids,
+                                state.blocks_in_chunk,
+                                state.blocks_per_window,
+                            )
+                        )
+                    scatter_cpu_to_paged_kv(
+                        {name: kv_caches[name] for name in state.layer_names},
+                        group_block_ids,
+                        src_g,
+                        state.blocks_in_chunk,
+                        skip_first_n_tokens=self._physical_skip_tokens(
+                            state, skip_first_n_tokens
+                        ),
+                        layout_hints=self._layout_hints,
+                        engine_kv_format=state.engine_kv_format,
+                        blocks_per_window=state.blocks_per_window,
+                    )
+            except (RuntimeError, ValueError, TypeError, IndexError):
+                logger.exception("Failed to scatter retrieved CPU context chunks")
+                ok = False
+            # Complete device writes before the server may reuse the slots.
+            torch_dev.synchronize()
+        ctx.commit_retrieve(key, instance_id)
         future.set_result(ok)
         return future
 

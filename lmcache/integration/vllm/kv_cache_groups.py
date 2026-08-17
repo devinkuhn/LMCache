@@ -19,11 +19,26 @@ from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 logger = init_logger(__name__)
 
 
+def _is_mamba_spec(spec: Any) -> bool:
+    """Return whether a spec (including a uniform wrapper) is Mamba-only.
+
+    vLLM's ``MambaManager`` explicitly undoes DCP block-size scaling because
+    every DCP rank holds the complete recurrent state. ``MambaSpec`` does not
+    expose ``dcp_replicated`` itself, so mirror that manager contract here.
+    """
+    per_layer_specs = getattr(spec, "kv_cache_specs", None)
+    if per_layer_specs:
+        return all(
+            _is_mamba_spec(layer_spec) for layer_spec in per_layer_specs.values()
+        )
+    return any(cls.__name__ == "MambaSpec" for cls in type(spec).__mro__)
+
+
 def _kv_cache_cp_shard_count(spec: Any, dcp_size: int) -> int:
     """Mirror vLLM's context-parallel KV shard-count contract."""
     if dcp_size < 1:
         raise ValueError(f"dcp_size must be positive, got {dcp_size}")
-    replicated = bool(getattr(spec, "dcp_replicated", False))
+    replicated = _is_mamba_spec(spec) or bool(getattr(spec, "dcp_replicated", False))
     override = getattr(spec, "dcp_kv_shard_count", None)
     if replicated:
         if override not in (None, 1):
@@ -68,7 +83,7 @@ def _physical_blocks_per_engine_block(
     Keep those layouts one-to-one instead of inferring geometry from unrelated
     counts.
     """
-    if _kv_cache_cp_shard_count(spec, dcp_size) >= dcp_size:
+    if _is_mamba_spec(spec) or (_kv_cache_cp_shard_count(spec, dcp_size) >= dcp_size):
         return 1
 
     manager_num_blocks = getattr(kv_cache_config, "num_blocks", None)
@@ -97,6 +112,19 @@ def _is_sliding_window_spec(spec: Any) -> bool:
     Subclasses such as ``SlidingWindowMLASpec`` count.
     """
     return any(cls.__name__ == "SlidingWindowSpec" for cls in type(spec).__mro__)
+
+
+def _is_mamba_align_spec(spec: Any) -> bool:
+    """Return whether one engine block is the complete reusable Mamba state.
+
+    Align-mode Mamba and linear-attention layers keep only the newest recurrent
+    snapshot. Across LMCache chunks this is a one-block window, not a full
+    history. Class-name detection keeps this module importable without vLLM.
+    """
+    return (
+        any(cls.__name__ == "MambaSpec" for cls in type(spec).__mro__)
+        and getattr(spec, "mamba_cache_mode", "none") == "align"
+    )
 
 
 def _resolve_per_layer_sw_sizes(
@@ -130,6 +158,8 @@ def _resolve_per_layer_sw_sizes(
             layer_spec = per_layer_specs[name] if per_layer_specs else spec
             if _is_sliding_window_spec(layer_spec):
                 per_layer_sw_size[layer_to_idx[name]] = layer_spec.sliding_window
+            elif _is_mamba_align_spec(layer_spec):
+                per_layer_sw_size[layer_to_idx[name]] = layer_spec.block_size
     return per_layer_sw_size
 
 

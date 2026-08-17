@@ -1,150 +1,149 @@
-# KV Cache Group Edits
+# vLLM Hybrid KV-Cache Page Normalization
 
-## Summary
+Status: implemented.
 
-`lmcache/integration/vllm/kv_cache_group_edits.py` is the single place where
-vLLM KV cache groups are re-presented ("edited") before LMCache registration.
-The connector calls `apply_kv_cache_group_edits(kv_cache_config, kv_caches)`
-once in `register_kv_caches`, and the edited dict feeds both engine-group-info
-creation (`kv_cache_groups.py`) and transfer registration.
+`lmcache/integration/vllm/kv_cache_group_edits.py` normalizes registered vLLM
+KV-cache tensors before LMCache derives transfer metadata. The normalization
+preserves storage and bytes while making each tensor's page dimension match
+the logical block identifiers supplied by the vLLM scheduler.
 
-LMCache derives each group's transfer metadata (block size, page layout,
-dtype) from the registered tensors, and interprets store/retrieve block IDs in
-vLLM's scheduler-side block-id space (`kv_cache_spec.block_size` units). The
-edits exist to restore one invariant the raw tensors can violate:
+`LMCacheMPConnector.register_kv_caches` calls
+`apply_kv_cache_group_edits(kv_cache_config, kv_caches, layout_hints)` once.
+The resulting views feed both engine-group metadata construction and transfer
+registration. A cache configuration without Mamba-compatible recurrent
+layers bypasses every rule.
 
-> **The registered tensor's paging granularity must equal the block-id
-> granularity.**
+## Addressing contract
 
-## Structure
+LMCache store and retrieve operations interpret block identifiers in units of
+`kv_cache_spec.block_size`. An attention backend may instead allocate tensors
+in smaller kernel pages, and a recurrent backend may allocate one opaque state
+page. Registering either layout without normalization can make LMCache derive
+the wrong block size or slot-compression ratio.
 
-Each case is one `KVCacheGroupEdit` rule in the module's `_EDITS` registry:
-`matches(spec, kv_cache)` decides **structurally** — from the vLLM spec kind
-(`get_kv_cache_spec_kind`, which also unwraps `UniformTypeKVCacheSpecs`) and
-the registered tensor, never from model name or architecture — and
-`apply(spec, kv_cache)` produces a view over the same storage. First matching
-rule wins; unmatched layers pass through. Covering a new group kind means
-adding one rule.
+Every normalization rule satisfies these invariants:
 
-Model name/arch is deliberately not an input: the same architecture yields
-different group structures depending on runtime decisions
-(`mamba_cache_mode`, attention backend's kernel block size, TP), all of which
-the config + tensors already resolve.
+- The output is a view over the input storage; no cache bytes are copied.
+- One output page contains exactly `kv_cache_spec.page_size_bytes` bytes.
+- The output page dimension uses scheduler-visible logical blocks.
+- Shape dimensions on opaque views provide byte addressing only; they do not
+  imply attention-head, key/value, or recurrent-state semantics.
+- A tensor that cannot satisfy the byte and divisibility checks raises
+  `ValueError` during cache registration.
 
-## Edits
+## Structural rules
 
-Both rules apply only to Mamba-hybrid models (the registry is only consulted
-when `kv_cache_config.has_mamba_layers`).
+Rules match the cache specification and registered tensor structure. Model
+names do not participate in selection. The first matching rule in `_EDITS`
+wins.
 
-### 1. Mamba state pages
+### Unified recurrent-state pages
 
-A Mamba / linear-attention layer (e.g. Qwen3.5 GDN) registers `[conv_state,
-ssm_state]` — two tensors with different shapes and dtypes, laid out
-contiguously in one padded page (`conv | ssm | pad`). The raw pair trips
-format discovery (the SSM view starts mid-page). The edit reinterprets each
-page as one bf16 tensor shaped `(num_blocks, 2, block_size, 1, head_size)`
-over the same storage, where `head_size` is derived so the bytes fill the page
-exactly.
+vLLM can register a recurrent layer as a contiguous tensor with shape
+`[num_blocks, 1, 1, page_elements]`. `_MambaUnifiedViewEdit` exposes the same
+bytes as one of these layouts:
 
-### 2. Sub-paged full attention
+- NHD: `[num_blocks, block_size, 1, head_size]`
+- HND: `[num_blocks, 1, block_size, head_size]`
 
-vLLM unifies page sizes across hybrid groups by inflating the attention
-*logical* block size (`vllm/platforms/interface.py:_align_hybrid_block_size`;
-Qwen3.5-0.8B: 544), while the attention backend re-pages the physical tensor
-at its own *kernel* block size (`vllm/v1/worker/utils.py:
-prepare_kernel_block_sizes`; FlashAttention on hybrids: 32). Logical block `n`
-then occupies the `k = logical/kernel` contiguous kernel pages
-`n*k .. n*k+k-1` (vLLM expands the worker-side block table the same way,
-`BlockTable.map_to_kernel_blocks`); the scheduler-side block IDs LMCache
-receives stay logical.
+The rule verifies the declared page size and requires `page_elements` to be
+divisible by `block_size`.
 
-Registering the raw kernel-paged tensor makes LMCache discover
-`block_size == kernel < logical`, and `_derive_compression_metadata`
-(`lmcache/v1/kv_layer_groups.py`) misclassifies the group as compressed:
-only `1/k` of each chunk's KV is transferred, addressed against the kernel
-page space. The edit re-views the tensor as
-`(num_kernel_pages / k, 2, logical_block_size, 1, head_size)` — a pure
-`view()`, valid because `k` kernel pages tile each logical page's bytes
-exactly (enforced; see Invariants).
+### Split recurrent-state pages
 
-## Startup validation
+A recurrent layer may register `[conv_state, ssm_state]`, where both tensors
+share a padded `conv | ssm | pad` page. `_MambaPageViewEdit` uses the view at
+the page base and exposes the complete page as
+`[num_blocks, 2, block_size, 1, head_size]`.
 
-`validate_kv_cache_groups` (called at connector init and again at
-registration) rejects group specs the transfer path cannot serve correctly,
-with one aggregated error: `CrossAttentionSpec`, and Mamba with
-`mamba_cache_mode != "align"` (no reusable snapshots). Declared slot
-compression (`compress_ratio > 1` / `tq_slot_size > 0`, e.g. DeepSeek-V4) is
-*not* rejected — those groups are served by the compression path in
-`lmcache/v1/kv_layer_groups.py` and only skipped by the edits here. Note the
-compression path still derives per-group ratios from the unified vLLM block
-size; switching it to per-group block sizes is pending in a separate PR.
+The rule verifies that the first tensor begins at storage offset zero and that
+its block stride equals the declared page size.
 
-Reference: vLLM PR #42828 (Mooncake store HMA support) uses the same
-validate-and-reject-up-front pattern, and is the reference design for the
-deferred follow-ups (per-group store/load masks; manager-mirroring hit
-computation). Caveat for the latter: LMCache's lookup doubles as prefetch, so
-vLLM's lookup-first-then-trim flow does not map directly. See the module
-docstring for the full check-when list.
+### Kernel-paged MLA storage
 
-## Non-edit: declared compression
+An MLA backend may register
+`[num_kernel_pages, kernel_block_size, head_size]` while the scheduler uses a
+larger logical block. `_SubpagedMLAAttentionViewEdit` groups contiguous kernel
+pages into
+`[num_logical_blocks, logical_block_size, head_size]`.
 
-Groups whose spec *declares* slot compression — `MLAAttentionSpec.
-compress_ratio > 1` (DeepSeek-V4 slot packing, `storage_block_size <
-block_size`) or `TQFullAttentionSpec.tq_slot_size > 0` — genuinely store fewer
-physical slots than logical tokens. They must reach the compression path in
-`lmcache/v1/kv_layer_groups.py` unedited. (DeepSeek-V3.2's `fp8_ds_mla` cache
-packs *bytes per slot*, not slots per block: its specs keep
-`block_size == scheduler block size` and `compress_ratio == 1`, so it never
-needs an edit either.)
+For Kimi-K3, twelve contiguous 64-token kernel pages form one 768-token
+logical page. Selection remains structural and therefore also supports other
+MLA configurations with the same byte-addressing relationship.
 
-The sub-paged rule's `matches` excludes declared-compression specs by their
-own fields (`compress_ratio` / `tq_slot_size`), and its `apply` additionally
-verifies by byte accounting that `k` kernel pages tile the logical page's
-bytes exactly — any *undeclared* packed layout fails with a loud `ValueError`
-rather than being transferred wrongly.
+### Kernel-paged standard attention storage
 
-## The opaque-page contract
+A standard attention backend may register
+`[num_kernel_pages, 2, kernel_block_size, num_heads, head_size]` while a hybrid
+cache configuration uses a larger scheduler block.
+`_SubpagedAttentionViewEdit` groups complete kernel pages into
+`[num_logical_blocks, 2, logical_block_size, 1, derived_head_size]`.
 
-An edited view's dims are addressing metadata only (block id → byte range).
-The named dims are **not** semantic: a Mamba view's "K plane" is conv/ssm
-bytes, and a sub-paged attention view's "K plane" interleaves true K and V at
-kernel-page granularity (true K is not contiguous across kernel pages, so no
-logical-block view can have a pure-K plane). The synthetic head shape
-`(1, page_bytes / (2 * block_size * elem))` signals this deliberately.
+The output can interleave physical K and V regions at kernel-page boundaries.
+Store and retrieve remain byte-exact because both operations use the same
+view.
 
-Byte transport round-trips correctly because store and retrieve share the same
-bijective block-id → bytes mapping. Consequences:
+## Declared slot compression
 
-- **Valid**: store/retrieve through the MP transfer path on the same engine
-  configuration.
-- **Not valid** for edited groups: content-aware processing (serde
-  compression, blending, head resharding, layout conversion), and sharing
-  cache entries across engines whose attention backends choose different
-  kernel block sizes (the byte order inside a logical page is
-  backend-dependent).
+A specification with `compress_ratio > 1` or `tq_slot_size > 0` declares
+physical slot compression. Such a group bypasses page normalization and uses
+the compression logic in `lmcache/v1/kv_layer_groups.py`.
 
-## Invariants
+The subpage rules additionally verify that the grouped kernel pages tile one
+logical page exactly. An undeclared packed layout therefore fails
+registration instead of being treated as ordinary paging.
 
-- Edits are pure tensor views over the registered storage — never copies.
-- A sub-paged view is only produced when `kernel_page_bytes * k ==
-  spec.page_size_bytes`; any mismatch raises `ValueError` (fail loudly rather
-  than silently transfer a compressed layout).
-- After edits, every registered tensor's block dim equals its group's
-  `kv_cache_spec.block_size`, so the server derives `compress_ratio == 1` for
-  these groups.
+## Unsupported cache specifications
+
+`validate_kv_cache_groups` rejects these specifications with one aggregated
+error:
+
+- cross-attention cache groups;
+- Mamba cache groups whose `mamba_cache_mode` is not `align`.
+
+Non-aligned recurrent caches do not preserve reusable state snapshots at
+logical block boundaries.
+
+## Format discovery
+
+`normalize_and_discover_per_layer_formats` detects each distinct tensor shape
+separately when a hybrid layer list contains more than one physical layout.
+Stride-based normalization also resolves singleton dimensions whose logical
+shape is ambiguous despite `torch.Tensor.is_contiguous()` returning true.
+
+Shared-memory migration applies the normalized shape and stride to the
+caller-owned tensor so the SHM lifetime remains attached to the registered
+object.
+
+## Compatibility limits
+
+Opaque page views support byte transport between store and retrieve paths that
+use the same engine configuration. They do not provide semantic K/V or
+recurrent-state structure for content-aware compression, blending, head
+resharding, or layout conversion. Cache artifacts are not portable between
+attention backends that choose different byte ordering inside a logical page.
+
+## Validation
+
+The unit suites cover:
+
+- zero-copy NHD and HND recurrent-state views;
+- zero-copy logical MLA views;
+- page-size and incomplete-page rejection;
+- mixed-layout format detection;
+- stride-truthful singleton-dimension normalization;
+- caller-owned shared-memory lifetime.
+
+The vLLM integration must also verify a cold store followed by a cache-hit
+retrieve with identical model output under the same cache geometry.
 
 ## Code map
 
-| Area | File |
+| Responsibility | Path |
 |---|---|
-| Edits (this doc) | `lmcache/integration/vllm/kv_cache_group_edits.py` |
-| Caller | `lmcache/integration/vllm/lmcache_mp_connector.py` (`register_kv_caches`) |
-| Compression-ratio derivation (downstream consumer) | `lmcache/v1/kv_layer_groups.py` |
-| vLLM block-size inflation | `vllm/platforms/interface.py` (`_align_hybrid_block_size`) |
-| vLLM kernel-page split + block-table expansion | `vllm/v1/worker/utils.py`, `vllm/v1/worker/block_table.py` |
-| End-to-end test | `.buildkite/k3_tests/multiprocess/scripts/run-single-test.sh` (`hma_lm_eval_qwen3_5`) |
-
-Testing is end-to-end only (the `hma_lm_eval_qwen3_5` store-vs-retrieve gsm8k
-check): the edit internals are expected to change as more group kinds are
-covered, so tests pin the observable contract — faithful retrieve — rather
-than view shapes.
+| Structural rules and validation | `lmcache/integration/vllm/kv_cache_group_edits.py` |
+| Registration caller | `lmcache/integration/vllm/lmcache_mp_connector.py` |
+| Shape and format discovery | `lmcache/v1/gpu_connector/kv_format/` |
+| Per-group transfer metadata | `lmcache/v1/kv_layer_groups.py` |
+| Shared-memory normalization | `lmcache/v1/platform/cpu/shm.py` |
+| Structural rule tests | `tests/v1/test_vllm_kv_cache_group_edits.py` |

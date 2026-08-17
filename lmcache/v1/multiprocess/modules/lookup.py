@@ -2,14 +2,16 @@
 """LookupModule: lookup, prefetch polling, and session lifecycle."""
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
+from typing import TYPE_CHECKING
 import threading
 import time
 
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
     ObjectKey,
     PrefetchHandle,
     ipc_key_to_object_keys,
@@ -24,6 +26,10 @@ from lmcache.v1.multiprocess.engine_module import (
 )
 from lmcache.v1.multiprocess.protocol import RequestType
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.native_storage_ops import Bitmap
 
 logger = init_logger(__name__)
 
@@ -78,46 +84,9 @@ def compute_extra_count(
     return tp - 1 if tp > world_size else 0
 
 
-def _get_prefix_hit_length(
-    found_prefix_len: int,
-    world_size: int,
-    num_object_groups: int,
-) -> int:
-    """Return the prefix hit length in chunks.
-
-    The chunk-major key layout packs ``world_size * num_object_groups`` keys per
-    chunk, so a fully-present prefix of ``found_prefix_len`` keys hits
-    ``found_prefix_len // (world_size * num_object_groups)`` chunks.
-
-    Args:
-        found_prefix_len: Length, in keys, of the contiguous found-key prefix.
-        world_size: Number of kv_rank shards per chunk.
-        num_object_groups: Number of object groups in the chunk-major layout.
-
-    Returns:
-        The prefix hit length in chunks (fully-present chunks of the prefix).
-
-    Example (2 object groups ``g0,g1``; 2 kv_ranks ``r0,r1`` -> 4 keys per
-    chunk). A found-key prefix of 6 keys covers one full chunk plus half the
-    next::
-
-        [c0g0r0, c0g0r1, c0g1r0, c0g1r1,   # chunk 0: fully present
-         c1g0r0, c1g0r1]                    # chunk 1: 2 of 4 -> partial, dropped
-
-    so ``found_prefix_len=6`` hits ``6 // (2 * 2) = 1`` whole chunk.
-
-    Note:
-        Correct only under full attention -- every object group present for
-        every hit chunk. Once sliding-window prefetch lands, the hit is no
-        longer a uniform contiguous key prefix and the hit length must come
-        from the fold's reported hit length instead.
-    """
-    return found_prefix_len // (world_size * num_object_groups)
-
-
 @dataclass
 class _PrefetchJob:
-    handle: PrefetchHandle
+    handles: tuple[PrefetchHandle, ...]
     world_size: int
     request_id: str
     # Number of tokens submitted for lookup (denominator for the L1+L2
@@ -126,13 +95,30 @@ class _PrefetchJob:
     # or chunk_hashes is empty).  Consumed at ``MP_LOOKUP_PREFETCH_END``
     # emission time in ``query_prefetch_status``.
     requested_tokens: int
-    num_object_groups: int = 1
+    object_keys_by_group: tuple[tuple[ObjectKey, ...], ...] = ()
+    """Object keys aligned with ``handles``, in chunk/rank order per group."""
+    prefetch_results: list["Bitmap | None"] = field(default_factory=list)
+    """Completed result bitmaps retained across nonblocking status polls."""
+    extra_count: int = 0
+    """Additional read locks acquired for every prefetched object."""
     # Captured at lookup time so the ``MP_LOOKUP_PREFETCH_END`` event can
     # carry them as labels.  ``model_name`` lets dashboards slice hit rate
     # per model in multi-model deployments; ``cache_salt`` slices per
     # tenant / isolation domain (an empty string means no salt set).
     model_name: str = ""
     cache_salt: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.handles:
+            raise ValueError("A prefetch job requires at least one handle")
+        if not self.prefetch_results:
+            self.prefetch_results = [None] * len(self.handles)
+        elif len(self.prefetch_results) != len(self.handles):
+            raise ValueError("Prefetch result slots must match the handle count")
+        if self.object_keys_by_group and len(self.object_keys_by_group) != len(
+            self.handles
+        ):
+            raise ValueError("Object-key groups must match the handle count")
 
 
 class LookupModule:
@@ -242,8 +228,10 @@ class LookupModule:
             )
         )
 
-        layout_desc = self._ctx.layout_desc_registry.find(model_name, world_size)
-        if layout_desc is None:
+        layout_descs = self._ctx.layout_desc_registry.find_object_group_layouts(
+            model_name, world_size
+        )
+        if layout_descs is None:
             logger.error(
                 "No GPU context found for model %s with world size %d during lookup!",
                 model_name,
@@ -251,12 +239,14 @@ class LookupModule:
             )
             self._register_prefetch_job(
                 _PrefetchJob(
-                    handle=PrefetchHandle(
-                        prefetch_request_id=-1,
-                        external_request_id=key.request_id,
-                        l1_found_indices=(),
-                        total_requested_keys=0,
-                        submit_time=time.monotonic(),
+                    handles=(
+                        PrefetchHandle(
+                            prefetch_request_id=-1,
+                            external_request_id=key.request_id,
+                            l1_found_indices=(),
+                            total_requested_keys=0,
+                            submit_time=time.monotonic(),
+                        ),
                     ),
                     world_size=1,
                     request_id=key.request_id,
@@ -273,12 +263,14 @@ class LookupModule:
         if not chunk_hashes:
             self._register_prefetch_job(
                 _PrefetchJob(
-                    handle=PrefetchHandle(
-                        prefetch_request_id=-1,
-                        external_request_id=key.request_id,
-                        l1_found_indices=(),
-                        total_requested_keys=0,
-                        submit_time=time.monotonic(),
+                    handles=(
+                        PrefetchHandle(
+                            prefetch_request_id=-1,
+                            external_request_id=key.request_id,
+                            l1_found_indices=(),
+                            total_requested_keys=0,
+                            submit_time=time.monotonic(),
+                        ),
                     ),
                     world_size=1,
                     request_id=key.request_id,
@@ -310,8 +302,8 @@ class LookupModule:
                         "model_name": model_name,
                         "chunk_size": self._ctx.chunk_size,
                         "seq_len": len(key.token_ids),
-                        "dtypes": [str(d) for d in layout_desc.dtypes],
-                        "shapes": [list(s) for s in layout_desc.shapes],
+                        "dtypes": [str(dtype) for dtype in layout_descs[0].dtypes],
+                        "shapes": [list(shape) for shape in layout_descs[0].shapes],
                     },
                 )
             )
@@ -320,27 +312,37 @@ class LookupModule:
         session.set_tokens(list(key.token_ids))
         session.lookup_ipc_key = key
 
-        # Lay keys out chunk-major across object groups (see
-        # _chunk_major_object_keys); pass the windows to the prefetch policy.
         attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
             model_name, world_size
         )
-        obj_keys = self._chunk_major_object_keys(key, chunk_hashes)
-
-        handle = self._ctx.storage_manager.submit_prefetch_task(
-            obj_keys,
-            layout_desc,
-            extra_count=extra_count,
-            external_request_id=key.request_id,
-            attn_desc=attn_desc,
+        if len(layout_descs) != attn_desc.num_object_groups:
+            raise ValueError(
+                "Object-group layouts and attention windows must have the "
+                f"same length: {len(layout_descs)} != {attn_desc.num_object_groups}"
+            )
+        object_keys_by_group = self._object_keys_by_group(key, chunk_hashes)
+        handles = tuple(
+            self._ctx.storage_manager.submit_prefetch_task(
+                list(group_keys),
+                layout_desc,
+                extra_count=extra_count,
+                external_request_id=key.request_id,
+                attn_desc=AttnWindowDesc(
+                    num_chunks_in_sw=[attn_desc.num_chunks_in_sw[object_group_id]]
+                ),
+            )
+            for object_group_id, (group_keys, layout_desc) in enumerate(
+                zip(object_keys_by_group, layout_descs, strict=True)
+            )
         )
         self._register_prefetch_job(
             _PrefetchJob(
-                handle=handle,
+                handles=handles,
                 world_size=key.world_size,
                 request_id=key.request_id,
                 requested_tokens=requested_tokens,
-                num_object_groups=attn_desc.num_object_groups,
+                object_keys_by_group=object_keys_by_group,
+                extra_count=extra_count,
                 model_name=model_name,
                 cache_salt=key.cache_salt,
             )
@@ -370,11 +372,14 @@ class LookupModule:
             )
             return 0
 
-        found = self._ctx.storage_manager.query_prefetch_lookup_hits(job.handle)
-        if found is None:
-            return None
+        found_prefix_lengths: list[int] = []
+        for handle in job.handles:
+            found = self._ctx.storage_manager.query_prefetch_lookup_hits(handle)
+            if found is None:
+                return None
+            found_prefix_lengths.append(found)
 
-        return _get_prefix_hit_length(found, job.world_size, job.num_object_groups)
+        return min(found_prefix_lengths) // job.world_size
 
     def query_prefetch_status(
         self,
@@ -404,17 +409,14 @@ class LookupModule:
             )
             return 0
 
-        found = self._ctx.storage_manager.query_prefetch_status(job.handle)
-        if found is None:
+        found_by_group = self._query_prefetch_results(job)
+        if found_by_group is None:
             return None
 
-        # NOTE(Kuntai): this assumes two things:
-        # 1. the world size is the same between keys
-        # 2. the lookup sort the keys in prefix order and breaks at the
-        #    first failure
-        found_count = _get_prefix_hit_length(
-            found.count_leading_ones(), job.world_size, job.num_object_groups
+        found_count = min(
+            found.count_leading_ones() // job.world_size for found in found_by_group
         )
+        self._release_nonservable_group_results(job, found_by_group, found_count)
 
         self._ctx.event_bus.publish(
             Event(
@@ -464,8 +466,21 @@ class LookupModule:
             )
             return 0
 
-        if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
-            return None
+        if len(job.handles) == 1:
+            if not self._ctx.storage_manager.wait_prefetch_status(
+                job.handles[0], timeout
+            ):
+                return None
+        else:
+            deadline = time.monotonic() + max(timeout, 0.0)
+            for handle, result in zip(job.handles, job.prefetch_results, strict=True):
+                if result is not None:
+                    continue
+                remaining = max(0.0, deadline - time.monotonic())
+                if not self._ctx.storage_manager.wait_prefetch_status(
+                    handle, remaining
+                ):
+                    return None
         return self.query_prefetch_status(request_id)
 
     def free_lookup_locks(
@@ -554,6 +569,62 @@ class LookupModule:
     # Internal helpers
     # -----------------------------------------------------------------
 
+    def _query_prefetch_results(self, job: _PrefetchJob) -> list["Bitmap"] | None:
+        """Collect each object group's result without polling it twice."""
+        for index, (handle, result) in enumerate(
+            zip(job.handles, job.prefetch_results, strict=True)
+        ):
+            if result is not None:
+                continue
+            found = self._ctx.storage_manager.query_prefetch_status(handle)
+            if found is not None:
+                job.prefetch_results[index] = found
+
+        if any(result is None for result in job.prefetch_results):
+            return None
+        return [result for result in job.prefetch_results if result is not None]
+
+    def _release_nonservable_group_results(
+        self,
+        job: _PrefetchJob,
+        found_by_group: list["Bitmap"],
+        found_count: int,
+    ) -> None:
+        """Release group-local hits beyond the common model-wide prefix."""
+        if not job.object_keys_by_group:
+            return
+
+        retained_keys_per_group = found_count * job.world_size
+        surplus_keys: list[ObjectKey] = []
+        for group_keys, found in zip(
+            job.object_keys_by_group, found_by_group, strict=True
+        ):
+            surplus_keys.extend(
+                group_keys[index]
+                for index in found.get_indices_list()
+                if index >= retained_keys_per_group
+            )
+        if surplus_keys:
+            self._ctx.storage_manager.finish_read_prefetched(
+                surplus_keys, extra_count=job.extra_count
+            )
+
+    def _object_keys_by_group(
+        self,
+        key: IPCCacheServerKey,
+        chunk_hashes: list[bytes],
+    ) -> tuple[tuple[ObjectKey, ...], ...]:
+        """Resolve chunk/rank-ordered object keys separately for each group."""
+        num_groups = self._ctx.layout_desc_registry.find_attn_desc(
+            key.model_name, key.world_size
+        ).num_object_groups
+        return tuple(
+            tuple(group_keys)
+            for group_keys in ipc_key_to_object_keys(
+                key, chunk_hashes, list(range(num_groups))
+            )
+        )
+
     def _chunk_major_object_keys(
         self,
         key: IPCCacheServerKey,
@@ -581,12 +652,10 @@ class LookupModule:
         Returns:
             The chunk-major flattened list of object keys across all groups.
         """
-        num_groups = self._ctx.layout_desc_registry.find_attn_desc(
-            key.model_name, key.world_size
-        ).num_object_groups
-        per_group = ipc_key_to_object_keys(key, chunk_hashes, list(range(num_groups)))
+        per_group = self._object_keys_by_group(key, chunk_hashes)
+        num_groups = len(per_group)
         if num_groups == 1:
-            return per_group[0]
+            return list(per_group[0])
         # Each per-group list is chunk-major / rank-minor of length
         # len(chunk_hashes) * num_ranks; recover num_ranks to slice per chunk.
         num_ranks = len(per_group[0]) // len(chunk_hashes) if chunk_hashes else 0

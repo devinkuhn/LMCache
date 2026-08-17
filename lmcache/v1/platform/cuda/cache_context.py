@@ -11,6 +11,7 @@ This module provides GPU-side KV cache management functionality, including:
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 import array
+import os
 
 # Third Party
 import torch
@@ -402,12 +403,35 @@ class GPUCacheContext(BaseCacheContext):
             )
             self.group_kv_pointers_.append(list_to_gpu_tensor(ptrs, self.device_))
 
-        # Temporary GPU buffer for transfers — a single flat uint8 buffer
+        # Temporary GPU buffer for transfers — a single flat uint8 buffer.
+        # The upstream default is four chunks.  LMCache-driven transfer
+        # already slices larger work into max_batch_size windows, so a
+        # one-chunk buffer is the minimum correct footprint and is useful for
+        # VRAM-constrained deployments such as Kimi-K3 TP8/DCP8.
+        staging_batch_size_raw = os.environ.get(
+            "LMCACHE_MP_GPU_STAGING_BATCH_SIZE", "4"
+        )
+        try:
+            staging_batch_size = int(staging_batch_size_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "LMCACHE_MP_GPU_STAGING_BATCH_SIZE must be an integer, got "
+                f"{staging_batch_size_raw!r}"
+            ) from exc
+        if not 1 <= staging_batch_size <= 64:
+            raise ValueError(
+                "LMCACHE_MP_GPU_STAGING_BATCH_SIZE must be in [1, 64], got "
+                f"{staging_batch_size}"
+            )
+        logger.info(
+            "LMCache GPU staging buffer batch size: %d chunk(s)",
+            staging_batch_size,
+        )
         self._temp_buffer = _TempGPUBuffer(
             kv_layer_groups_manager=self.kv_layer_groups_manager_,
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
             device=self.device_,
-            max_batch_size=4,
+            max_batch_size=staging_batch_size,
         )
 
         # GPU streams

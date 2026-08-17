@@ -135,6 +135,7 @@ class L2AdapterInterface(ABC):
         # every adapter exposes the same shape via ``get_usage()``.
         self._max_capacity_bytes: int = max_capacity_bytes
         self._total_bytes_used: int = 0
+        self._reserved_store_bytes: int = 0
         self._bytes_by_cache_salt: dict[str, int] = {}
         self._usage_lock = threading.Lock()
 
@@ -354,13 +355,8 @@ class L2AdapterInterface(ABC):
         """Register a listener to receive L2 adapter events."""
         self._listeners.append(listener)
 
-    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
-        """Update byte accounting and notify listeners that ``keys`` were
-        stored. ``sizes[i]`` is the byte size of ``keys[i]``.
-
-        Accounting is held under ``_usage_lock``; listener callbacks fire
-        outside the lock so a slow listener cannot stall further notifies.
-        """
+    def _account_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        """Apply stored-key byte accounting without invoking listeners."""
         # Aggregate per-salt deltas before touching
         # ``_bytes_by_cache_salt`` — one dict read/write per unique
         # salt instead of one per key. This matters when the registry is
@@ -377,8 +373,89 @@ class L2AdapterInterface(ABC):
                 self._bytes_by_cache_salt[salt] = (
                     self._bytes_by_cache_salt.get(salt, 0) + d
                 )
+
+    def _try_reserve_store_bytes(self, size: int) -> bool:
+        """Reserve capacity before an asynchronous L2 store is submitted.
+
+        The reservation covers transient backend storage as well as the final
+        object. This keeps a burst of in-flight writes from exceeding a hard
+        adapter capacity before completion accounting becomes visible.
+        """
+        if size < 0:
+            raise ValueError("store reservation size must be non-negative")
+        with self._usage_lock:
+            projected = self._total_bytes_used + self._reserved_store_bytes + size
+            if self._max_capacity_bytes > 0 and projected > self._max_capacity_bytes:
+                return False
+            self._reserved_store_bytes += size
+            return True
+
+    def _settle_store_reservation(
+        self,
+        reserved_bytes: int,
+        keys: list[ObjectKey],
+        sizes: list[int],
+    ) -> None:
+        """Atomically release a store reservation and account durable keys."""
+        if reserved_bytes < 0:
+            raise ValueError("reserved_bytes must be non-negative")
+
+        delta: dict[str, int] = {}
+        total_delta = 0
+        for key, size in zip(keys, sizes, strict=True):
+            delta[key.cache_salt] = delta.get(key.cache_salt, 0) + size
+            total_delta += size
+
+        with self._usage_lock:
+            if reserved_bytes > self._reserved_store_bytes:
+                raise RuntimeError(
+                    "store reservation accounting underflow: "
+                    f"settling {reserved_bytes} bytes with only "
+                    f"{self._reserved_store_bytes} reserved"
+                )
+            self._reserved_store_bytes -= reserved_bytes
+            self._total_bytes_used += total_delta
+            for salt, d in delta.items():
+                self._bytes_by_cache_salt[salt] = (
+                    self._bytes_by_cache_salt.get(salt, 0) + d
+                )
+
+    def _release_store_reservation(self, reserved_bytes: int) -> None:
+        """Release capacity for a store that will not produce a completion."""
+        if reserved_bytes < 0:
+            raise ValueError("reserved_bytes must be non-negative")
+        with self._usage_lock:
+            if reserved_bytes > self._reserved_store_bytes:
+                raise RuntimeError(
+                    "store reservation accounting underflow: "
+                    f"releasing {reserved_bytes} bytes with only "
+                    f"{self._reserved_store_bytes} reserved"
+                )
+            self._reserved_store_bytes -= reserved_bytes
+
+    def get_reserved_store_bytes(self) -> int:
+        """Return bytes reserved by submitted stores awaiting completion."""
+        with self._usage_lock:
+            return self._reserved_store_bytes
+
+    def _notify_keys_stored_listeners(
+        self,
+        keys: list[ObjectKey],
+        sizes: list[int],
+    ) -> None:
+        """Notify stored-key observers after accounting is committed."""
         for listener in self._listeners:
             listener.on_l2_keys_stored(keys, sizes)
+
+    def _notify_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        """Update byte accounting and notify listeners that ``keys`` were
+        stored. ``sizes[i]`` is the byte size of ``keys[i]``.
+
+        Accounting is held under ``_usage_lock``; listener callbacks fire
+        outside the lock so a slow listener cannot stall further notifies.
+        """
+        self._account_keys_stored(keys, sizes)
+        self._notify_keys_stored_listeners(keys, sizes)
 
     def _notify_keys_accessed(self, keys: list[ObjectKey]) -> None:
         # ``_notify_keys_accessed`` carries no byte impact — only LRU

@@ -44,6 +44,7 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
     validate_kv_cache_groups,
 )
 from lmcache.integration.vllm.kv_cache_groups import (
+    _is_mamba_spec,
     create_engine_group_infos_from_vllm,
     effective_tokens_per_block,
 )
@@ -102,6 +103,34 @@ logger = lmcache_init_logger(__name__)
 
 
 # Helper functions
+def _recurrent_safe_lookup_end(num_tokens: int, chunk_tokens: int) -> int:
+    """Return the largest reusable recurrent-state prefix boundary.
+
+    vLLM recomputes the final prompt token after a complete external prefix
+    hit so the forward pass can produce sampling logits. A recurrent cache
+    object stores the state *after* its boundary token, so restoring a state
+    through the final prompt token would apply that token twice. Keep the
+    external hit below the final token and align it to the LMCache object
+    boundary. Attention-only models do not use this restriction.
+
+    Args:
+        num_tokens: Number of prompt tokens available to the lookup.
+        chunk_tokens: Tokens represented by one LMCache object.
+
+    Returns:
+        A non-negative object-aligned prefix length strictly below the final
+        prompt token.
+
+    Raises:
+        ValueError: If ``chunk_tokens`` is not positive.
+    """
+    if chunk_tokens <= 0:
+        raise ValueError(f"chunk_tokens must be positive, got {chunk_tokens}")
+    if num_tokens <= 1:
+        return 0
+    return ((num_tokens - 1) // chunk_tokens) * chunk_tokens
+
+
 def _has_preemption_reqs(scheduler_output: SchedulerOutput) -> bool:
     """Return whether the scheduler output contains preemption-related requests.
 
@@ -464,6 +493,42 @@ class LMCacheMPRequestMetadata:
             "number of LMCache hit tokens. "
         )
         if end_token_idx > start_token_idx:
+            # allocated_block_ids must cover [start_token_idx, end_token_idx)
+            # in every engine group. slice_block_ids_per_group() validates
+            # chunk alignment only; its plain Python slice truncates
+            # silently, so a tracker primed with LMCache hit counts on a
+            # scheduling pass whose allocation never materialised would emit
+            # a retrieve op with too few block ids. The MP server fails
+            # closed on the short list, wasting a doomed round-trip and
+            # relying on the failure being surfaced at all. Suppress the op
+            # instead so the request recomputes cleanly. Never clamp
+            # end_token_idx: a clamped retrieve completes a load vLLM does
+            # not expect and re-creates the desync downstream.
+            # One allocated id of group g covers group_tokens_per_block[g]
+            # global token positions (KV-spec block_size, DCP-scaled), the
+            # same arithmetic GetStoreMetadata uses to bound its
+            # allocated_tokens.
+            for group_idx, tokens_per_block in enumerate(group_tokens_per_block):
+                allocated = len(tracker.allocated_block_ids.get(group_idx, []))
+                if allocated * tokens_per_block < end_token_idx:
+                    logger.warning(
+                        "LMCache retrieve suppressed for request_id=%s: "
+                        "engine group %d has %d allocated block(s) x %d "
+                        "tokens/block = %d tokens < end_token_idx=%d "
+                        "(start_token_idx=%d, vllm_hit_tokens=%d, "
+                        "lmcache_hit_tokens=%d) -- tracker/allocation "
+                        "desync; falling back to recompute.",
+                        tracker.request_id,
+                        group_idx,
+                        allocated,
+                        tokens_per_block,
+                        allocated * tokens_per_block,
+                        end_token_idx,
+                        start_token_idx,
+                        tracker.num_vllm_hit_tokens,
+                        tracker.num_lmcache_hit_tokens,
+                    )
+                    return None
             block_ids = slice_block_ids_per_group(
                 tracker.allocated_block_ids,
                 group_tokens_per_block,
@@ -685,6 +750,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             if kv_cache_config is not None
             else ()
         )
+        self._has_recurrent_cache = any(
+            _is_mamba_spec(group.kv_cache_spec) for group in vllm_groups
+        )
         # Tokens covered by one paged chunk (one block ID) of each engine
         # group, from the group's KV cache spec. Hybrid models can mix
         # different values (e.g. gemma-4: sliding-window groups 32,
@@ -754,11 +822,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         kv_cache_config = getattr(self, "_kv_cache_config", None)
         # Must precede both group-info creation and transfer registration so
         # they see the same edited views.
-        kv_caches = apply_kv_cache_group_edits(kv_cache_config, kv_caches)
+        layout_hints = vllm_layout_hints()
+        kv_caches = apply_kv_cache_group_edits(
+            kv_cache_config, kv_caches, layout_hints=layout_hints
+        )
         engine_group_infos = create_engine_group_infos_from_vllm(
             kv_cache_config,
             kv_caches,
-            layout_hints=vllm_layout_hints(),
+            layout_hints=layout_hints,
             dcp_size=self.worker_adapter.parallel_strategy.dcp_size,
         )
         self.worker_adapter.register_kv_caches(
@@ -994,9 +1065,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if request.status == RequestStatus.PREEMPTED:
             return 0, False
 
+        lookup_token_ids = list(request.all_token_ids)
+        if self._has_recurrent_cache:
+            safe_end = _recurrent_safe_lookup_end(
+                len(lookup_token_ids),
+                self.scheduler_adapter.lmcache_tokens_per_chunk,
+            )
+            del lookup_token_ids[safe_end:]
+            if not lookup_token_ids:
+                return 0, False
+
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
-            token_ids=list(request.all_token_ids),
+            token_ids=lookup_token_ids,
             cache_salt=tracker.cache_salt,
         )
 

@@ -40,6 +40,10 @@ class VLLM_Detector(EngineDetector):
         # (HND) or BS/NH (NHD) -- indistinguishable from the shape alone, so the
         # resolved kv_layout decides. Split [NB, *, *, 2*HS] into
         # [NB, *, *, 2, HS].
+
+        # The legacy TWO_HS format names also represent opaque combined-state
+        # storage. They remain part of the public format registry, so detection
+        # uses them even when the final dimension is not semantically K+V.
         if (
             isinstance(kv_caches, list)
             and kv_caches
