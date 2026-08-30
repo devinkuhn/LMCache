@@ -186,6 +186,27 @@ class MockNativeConnector:
             pass
 
 
+class DeferredExistsConnector(MockNativeConnector):
+    """Hold EXISTS completion to expose the submit-to-lock race window."""
+
+    def __init__(self):
+        super().__init__()
+        self.pending_exists: tuple[int, list[str]] | None = None
+
+    def submit_batch_exists(self, keys: list[str]) -> int:
+        with self._lock:
+            fid = self._next_id
+            self._next_id += 1
+        self.pending_exists = (fid, list(keys))
+        return fid
+
+    def complete_exists(self) -> None:
+        assert self.pending_exists is not None
+        fid, keys = self.pending_exists
+        self.pending_exists = None
+        self._push_completion(fid, True, "", [key in self._store for key in keys])
+
+
 # =============================================================================
 # Test Fixtures
 # =============================================================================
@@ -1220,6 +1241,70 @@ class TestDeleteInterface:
 
     def test_delete_empty_keys(self, adapter):
         adapter.delete([])  # should not raise
+
+    def test_delete_skips_lookup_locked_keys(self, adapter):
+        keys = [create_object_key(i) for i in range(2)]
+        objects = [create_memory_obj(fill_value=float(i)) for i in range(2)]
+        adapter.submit_store_task(keys, objects)
+        assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+        adapter.pop_completed_store_tasks()
+
+        task_id = adapter.submit_lookup_and_lock_task([keys[0]], {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
+        assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
+
+        adapter.delete(keys)
+
+        task_id = adapter.submit_lookup_and_lock_task(keys, {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
+        bitmap = adapter.query_lookup_and_lock_result(task_id)
+        assert bitmap.test(0) is True
+        assert bitmap.test(1) is False
+
+        # The second lookup took another lock on keys[0]. Release both before
+        # proving the formerly protected key becomes deletable again.
+        adapter.submit_unlock([keys[0]])
+        adapter.submit_unlock([keys[0]])
+        adapter.delete([keys[0]])
+        task_id = adapter.submit_lookup_and_lock_task([keys[0]], {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
+        assert adapter.query_lookup_and_lock_result(task_id).test(0) is False
+
+    def test_delete_all_locked_keys_is_noop(self, adapter):
+        key = create_object_key(1)
+        adapter.submit_store_task([key], [create_memory_obj()])
+        assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+        adapter.pop_completed_store_tasks()
+
+        task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
+        assert wait_for_event_fd(adapter.get_lookup_and_lock_event_fd(), timeout=5.0)
+        assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
+
+        adapter.delete([key])
+        assert _object_key_to_string(key) in adapter._client._store
+        adapter.submit_unlock([key])
+
+    def test_delete_skips_lookup_that_has_not_completed(self):
+        client = DeferredExistsConnector()
+        adapter = NativeConnectorL2Adapter(client)
+        key = create_object_key(1)
+        try:
+            adapter.submit_store_task([key], [create_memory_obj()])
+            assert wait_for_event_fd(adapter.get_store_event_fd(), timeout=5.0)
+            adapter.pop_completed_store_tasks()
+
+            task_id = adapter.submit_lookup_and_lock_task([key], {0: _EMPTY_LAYOUT})
+            adapter.delete([key])
+            assert _object_key_to_string(key) in client._store
+
+            client.complete_exists()
+            assert wait_for_event_fd(
+                adapter.get_lookup_and_lock_event_fd(), timeout=5.0
+            )
+            assert adapter.query_lookup_and_lock_result(task_id).test(0) is True
+            adapter.submit_unlock([key])
+        finally:
+            adapter.close()
 
     def test_delete_batch(self, adapter):
         keys = [create_object_key(i) for i in range(5)]
