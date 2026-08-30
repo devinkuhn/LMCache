@@ -192,6 +192,7 @@ class TestRecordReplayRoundtrip:
         # Every op from the script appears in stats.
         expected_substrings = [
             "reserve_write",
+            "reserve_write_detailed",
             "finish_write",
             "submit_prefetch_task",
             "read_prefetched_results.__enter__",
