@@ -132,6 +132,7 @@ class L1EvictionController(EvictionController):
         self._l1_manager.register_listener(self._listener)
         self._event_bus = get_event_bus()
         self._last_extra_log = time.monotonic()
+        self._immediate_request = threading.Event()
 
         self._write_back_enabled = eviction_config.write_back_on_evict
         self._periodic_backup_enabled = eviction_config.periodic_flush_interval > 0
@@ -157,6 +158,16 @@ class L1EvictionController(EvictionController):
             )
         if l2_adapters:
             self.set_l2_adapters(l2_adapters)
+
+    def request_immediate_eviction(self) -> None:
+        """Wake the eviction loop for a capacity-blocked store."""
+        self._immediate_request.set()
+
+    def stop(self) -> None:
+        """Stop promptly even when the eviction loop is waiting."""
+        self._stop_flag.set()
+        self._immediate_request.set()
+        self._thread.join()
 
     def set_l2_adapters(self, l2_adapters: Mapping[int, object]) -> None:
         """Replace the adapters eligible for synchronous L1 writeback.
@@ -340,7 +351,9 @@ class L1EvictionController(EvictionController):
         backup_interval = self._eviction_config.periodic_flush_interval
 
         while not self._stop_flag.is_set():
-            if self._stop_flag.wait(1):
+            immediate = self._immediate_request.wait(timeout=1.0)
+            self._immediate_request.clear()
+            if self._stop_flag.is_set():
                 break
             used_bytes, total_bytes = self._l1_manager.get_memory_usage()
             if self._eviction_config.extra_logging_enabled:
@@ -371,9 +384,10 @@ class L1EvictionController(EvictionController):
                 continue
 
             logger.info(
-                "L1 memory usage %.2f above watermark %.2f; triggering eviction.",
+                "L1 memory usage %.2f above watermark %.2f; triggering eviction%s.",
                 usage,
                 watermark,
+                " immediately" if immediate else "",
             )
             actions = self._eviction_policy.get_eviction_actions(
                 eviction_ratio,
