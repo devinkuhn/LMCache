@@ -68,10 +68,10 @@ ordering approximation; runtime accesses continue to update the normal LRU.
       also be aligned (typically to 4096 bytes on local disks, or to the
       FS block size on parallel filesystems).  This is controlled by
       ``--l1-align-bytes`` (default ``4096``) -- raise it to match the
-      FS block size when running on a filesystem with larger blocks.  If
-      the buffer is misaligned, the connector reports a runtime error instead
-      of silently falling back to buffered I/O.  This protects real-disk
-      benchmark runs from accidentally measuring the page cache.
+      FS block size when running on a filesystem with larger blocks. If the
+      buffer is misaligned, the connector falls back to buffered I/O for that
+      operation. Correctness is preserved, but a real-disk benchmark must
+      align both length and address to guarantee direct I/O.
 
    If unsure, start with ``use_odirect: false`` and confirm correctness
    before enabling ``O_DIRECT``.
