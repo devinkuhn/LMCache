@@ -206,6 +206,22 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         with self._lock:
             return MappingProxyType(dict(self._key_sizes))
 
+    def has_inflight_store_for_keys(self, keys: list[ObjectKey]) -> bool:
+        """Return whether a native store may still read any requested buffer.
+
+        A timed-out synchronous store deliberately remains in flight. Callers
+        that may free or reuse its L1 buffers must therefore defer those keys
+        until the native completion releases ``_pending_store_sizes``.
+        """
+        requested = set(keys)
+        if not requested:
+            return False
+        with self._lock:
+            return any(
+                not requested.isdisjoint(store.keys)
+                for store in self._pending_store_sizes.values()
+            )
+
     # ---------------------------------------------------------------
     # Event Fd Interface
     # ---------------------------------------------------------------
