@@ -1394,6 +1394,7 @@ class LMCacheMPWorkerAdapter:
                 layout_hints=layout_hints,
                 engine_group_infos=self.engine_group_infos,
                 engine_type=EngineType.VLLM,
+                tokens_per_chunk=self.lmcache_tokens_per_chunk,
             )
         except TimeoutError:
             raise ConnectionError(
