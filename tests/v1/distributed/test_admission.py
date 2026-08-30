@@ -7,6 +7,7 @@ import pytest
 from lmcache.v1.distributed.admission import (
     AdmissionAttempt,
     AdmissionFailure,
+    AdmissionOutcome,
     AdmissionWaitResult,
     reserve_with_eviction_backpressure,
 )
@@ -24,7 +25,7 @@ def test_capacity_failure_retries_after_eviction_change() -> None:
             return AdmissionAttempt.failure(AdmissionFailure.CAPACITY)
         return AdmissionAttempt.success("reserved")
 
-    outcome = reserve_with_eviction_backpressure(
+    outcome: AdmissionOutcome[str] = reserve_with_eviction_backpressure(
         attempt=attempt,
         get_generation=lambda: 0,
         request_eviction=lambda: callbacks.append("evict"),
@@ -53,7 +54,7 @@ def test_conflict_fails_without_eviction() -> None:
         nonlocal eviction_calls
         eviction_calls += 1
 
-    outcome = reserve_with_eviction_backpressure(
+    outcome: AdmissionOutcome[object] = reserve_with_eviction_backpressure(
         attempt=lambda: AdmissionAttempt.failure(AdmissionFailure.CONFLICT),
         get_generation=lambda: 0,
         request_eviction=request_eviction,
@@ -77,7 +78,7 @@ def test_capacity_timeout_is_bounded_and_structured() -> None:
         nonlocal timed_out
         timed_out += 1
 
-    outcome = reserve_with_eviction_backpressure(
+    outcome: AdmissionOutcome[object] = reserve_with_eviction_backpressure(
         attempt=lambda: AdmissionAttempt.failure(AdmissionFailure.CAPACITY),
         get_generation=lambda: 0,
         request_eviction=lambda: None,
