@@ -678,6 +678,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if _is_mamba_group_spec(group.kv_cache_spec)
         }
+        logger.info(
+            "Detected recurrent KV cache groups: %s",
+            sorted(self._mamba_group_ids),
+        )
         for engine_group_idx, tokens_per_block in enumerate(
             self._group_tokens_per_block
         ):

@@ -155,8 +155,11 @@ seven are null-block placeholders and the final ID is the exact boundary block.
 This lets grouped atomic-store validation retain its full-coverage invariant
 while the all-null-chunk logic continues to reject invalid recurrent objects.
 If any boundary needed by a store has no exact handoff, the connector emits no
-store and retries after a later scheduler step rather than caching a stale
-positional state.
+store for that boundary rather than caching a stale positional state. Handoffs
+can trail scheduler token accounting by one step, so the connector emits the
+longest contiguous prefix for which every recurrent group has an exact
+handoff and defers the remaining suffix. This prevents each newly scheduled
+suffix from suppressing an already-ready prefix throughout a chunked prefill.
 
 ## Example
 

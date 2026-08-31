@@ -259,7 +259,13 @@ class LMCacheMPRequestMetadata:
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
             mamba_group_ids: Engine groups whose positional block tables must
-                be replaced by exact recurrent-boundary handoffs.
+                be replaced by exact recurrent-boundary handoffs. When a later
+                boundary has not arrived, the metadata covers only the longest
+                contiguous handoff-complete prefix.
+
+        Returns:
+            Store metadata for the next complete chunk range, or ``None`` when
+            no complete chunk is available.
         """
         num_engine_groups = len(group_tokens_per_block)
         # NOTE: the invariant here is that `num_stored_tokens` should
@@ -310,7 +316,57 @@ class LMCacheMPRequestMetadata:
 
         if num_chunks >= 1:
             start_token_idx = tracker.num_stored_tokens
-            end_token_idx = start_token_idx + num_chunks * lmcache_tokens_per_chunk
+            candidate_end_token_idx = (
+                start_token_idx + num_chunks * lmcache_tokens_per_chunk
+            )
+            end_token_idx = candidate_end_token_idx
+            if mamba_group_ids:
+                received_handoff_boundaries = {
+                    group_id: sorted(
+                        tracker.exact_mamba_boundary_blocks.get(group_id, {})
+                    )
+                    for group_id in sorted(mamba_group_ids)
+                }
+                required_boundaries = list(
+                    range(
+                        start_token_idx + lmcache_tokens_per_chunk,
+                        candidate_end_token_idx + 1,
+                        lmcache_tokens_per_chunk,
+                    )
+                )
+                end_token_idx = start_token_idx
+                for boundary_tokens in required_boundaries:
+                    if not all(
+                        boundary_tokens
+                        in tracker.exact_mamba_boundary_blocks.get(group_id, {})
+                        for group_id in mamba_group_ids
+                    ):
+                        break
+                    end_token_idx = boundary_tokens
+                if end_token_idx == start_token_idx:
+                    logger.debug(
+                        "Suppressing recurrent store: request_id=%s, "
+                        "recurrent_groups=%s, received_handoff_boundaries=%s, "
+                        "required_store_boundaries=%s, reason=no contiguous "
+                        "exact recurrent boundary",
+                        tracker.request_id,
+                        sorted(mamba_group_ids),
+                        received_handoff_boundaries,
+                        required_boundaries,
+                    )
+                    return None
+                if end_token_idx < candidate_end_token_idx:
+                    logger.debug(
+                        "Deferring recurrent store suffix: request_id=%s, "
+                        "recurrent_groups=%s, received_handoff_boundaries=%s, "
+                        "required_store_boundaries=%s, store_end=%d, "
+                        "reason=later exact recurrent boundary unavailable",
+                        tracker.request_id,
+                        sorted(mamba_group_ids),
+                        received_handoff_boundaries,
+                        required_boundaries,
+                        end_token_idx,
+                    )
             block_ids = slice_block_ids_per_group(
                 tracker.allocated_block_ids,
                 group_tokens_per_block,
