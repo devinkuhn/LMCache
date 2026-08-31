@@ -788,6 +788,7 @@ class EngineDrivenTransferContext(TransferContext):
                     out=(out_buffers[group_idx] if out_buffers is not None else None),
                     chunk_indices=indices,
                     blocks_per_window=group.layout.blocks_per_window,
+                    group_idx=group.layout.object_group_id,
                 )
             )
         return payloads
@@ -799,7 +800,7 @@ class EngineDrivenTransferContext(TransferContext):
         group_payloads: list[list[torch.Tensor]],
         skip_first_n_tokens: int,
     ) -> None:
-        """Validate all group payloads before scheduling any destination writes."""
+        """Validate and scatter each group's retained payload suffix."""
         num_chunks = _validate_group_block_ids(self._worker_groups, block_ids)
         if len(group_payloads) != len(self._worker_groups):
             raise ValueError("retrieve payload does not cover every registered group")
@@ -807,10 +808,15 @@ class EngineDrivenTransferContext(TransferContext):
         for group_idx, (group, payloads) in enumerate(
             zip(self._worker_groups, group_payloads, strict=True)
         ):
-            if len(payloads) != num_chunks:
+            retained_chunks = (
+                num_chunks
+                if group.layout.num_chunks_in_window < 0
+                else min(num_chunks, group.layout.num_chunks_in_window)
+            )
+            if len(payloads) != retained_chunks:
                 raise ValueError(
                     f"group {group_idx} returned {len(payloads)} chunks; "
-                    f"expected {num_chunks}"
+                    f"expected {retained_chunks}"
                 )
             expected_shape = torch.Size(group.layout.shape)
             expected_dtype = getattr(torch, group.layout.dtype_str)
@@ -826,7 +832,9 @@ class EngineDrivenTransferContext(TransferContext):
         for group_idx, (group, payloads) in enumerate(
             zip(self._worker_groups, group_payloads, strict=True)
         ):
-            group_block_ids = block_ids[group_idx]
+            skipped_chunks = num_chunks - len(payloads)
+            skipped_blocks = skipped_chunks * group.layout.blocks_per_chunk
+            group_block_ids = block_ids[group_idx][skipped_blocks:]
             if group.layout.group_kind == "recurrent" and skip_first_n_tokens == 0:
                 payloads, group_block_ids = _collapse_chunks_for_single_destination(
                     payloads,
@@ -837,8 +845,9 @@ class EngineDrivenTransferContext(TransferContext):
             physical_block_size = (
                 group.layout.shape[-2] // group.layout.blocks_per_window
             )
+            skipped_logical_tokens = skipped_blocks * group.layout.tokens_per_block
             physical_skip = (
-                skip_first_n_tokens
+                max(0, skip_first_n_tokens - skipped_logical_tokens)
                 * physical_block_size
                 // group.layout.tokens_per_block
             )
@@ -851,6 +860,7 @@ class EngineDrivenTransferContext(TransferContext):
                 layout_hints=self._layout_hints,
                 engine_kv_format=group.engine_kv_format,
                 blocks_per_window=group.layout.blocks_per_window,
+                group_idx=group.layout.object_group_id,
             )
 
     @property
