@@ -489,6 +489,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
       enters vLLM's waiting queue. Disabled by default.
     """
 
+    @property
+    def requires_local_prefill_serialization(self) -> bool:
+        return self._has_recurrent_cache and self._kv_transfer_config.is_kv_producer
+
     def __init__(
         self,
         vllm_config: "VllmConfig",

@@ -92,6 +92,27 @@ def test_live_six_group_detection_finds_only_recurrent_groups() -> None:
     assert detected_group_ids == RECURRENT_GROUP_IDS
 
 
+@pytest.mark.parametrize(
+    ("has_recurrent_cache", "is_kv_producer", "expected"),
+    [
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+        (False, False, False),
+    ],
+)
+def test_local_prefill_serialization_requires_recurrent_producer(
+    has_recurrent_cache: bool,
+    is_kv_producer: bool,
+    expected: bool,
+) -> None:
+    connector = cast(LMCacheMPConnector, object.__new__(LMCacheMPConnector))
+    connector._has_recurrent_cache = has_recurrent_cache
+    connector._kv_transfer_config = SimpleNamespace(is_kv_producer=is_kv_producer)
+
+    assert connector.requires_local_prefill_serialization is expected
+
+
 def _store_tracker(num_chunks: int = 2) -> LMCacheMPRequestTracker:
     """Build a tracker with complete positional tables for DFlash geometry."""
     num_tokens = num_chunks * CHUNK_TOKENS
