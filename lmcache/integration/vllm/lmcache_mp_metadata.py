@@ -344,7 +344,7 @@ class LMCacheMPRequestMetadata:
                         break
                     end_token_idx = boundary_tokens
                 if end_token_idx == start_token_idx:
-                    logger.debug(
+                    logger.info(
                         "Suppressing recurrent store: request_id=%s, "
                         "recurrent_groups=%s, received_handoff_boundaries=%s, "
                         "required_store_boundaries=%s, reason=no contiguous "
@@ -356,15 +356,17 @@ class LMCacheMPRequestMetadata:
                     )
                     return None
                 if end_token_idx < candidate_end_token_idx:
-                    logger.debug(
-                        "Deferring recurrent store suffix: request_id=%s, "
+                    logger.info(
+                        "Truncating recurrent store to handoff-ready prefix: "
+                        "request_id=%s, "
                         "recurrent_groups=%s, received_handoff_boundaries=%s, "
-                        "required_store_boundaries=%s, store_end=%d, "
+                        "required_store_boundaries=%s, store_range=[%d, %d), "
                         "reason=later exact recurrent boundary unavailable",
                         tracker.request_id,
                         sorted(mamba_group_ids),
                         received_handoff_boundaries,
                         required_boundaries,
+                        start_token_idx,
                         end_token_idx,
                     )
             block_ids = slice_block_ids_per_group(
@@ -398,6 +400,17 @@ class LMCacheMPRequestMetadata:
                 direction="STORE",
                 op=op,
                 cache_salt=tracker.cache_salt,
+            )
+            logger.info(
+                "Emitting store metadata: request_id=%s, store_range=[%d, %d), "
+                "block_counts_by_group=%s",
+                tracker.request_id,
+                start_token_idx,
+                end_token_idx,
+                {
+                    group_id: len(group_block_ids)
+                    for group_id, group_block_ids in enumerate(block_ids)
+                },
             )
 
             # Update the request tracker

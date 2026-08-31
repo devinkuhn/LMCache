@@ -1437,12 +1437,26 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> None:
         """Record one request's exact core-selected recurrent blocks."""
         handoffs = getattr(scheduler_output, "partial_tail_offloads", None) or {}
+        received_handoff_boundaries: dict[int, set[int]] = {}
         for group_id, block_id, boundary_tokens in handoffs.get(request_id, ()):
             if group_id not in self._mamba_group_ids or block_id <= 0:
                 continue
             tracker.exact_mamba_boundary_blocks.setdefault(group_id, {})[
                 boundary_tokens
             ] = block_id
+            received_handoff_boundaries.setdefault(group_id, set()).add(boundary_tokens)
+        if received_handoff_boundaries:
+            logger.info(
+                "Ingested exact recurrent handoffs: request_id=%s, "
+                "received_handoff_boundaries=%s",
+                request_id,
+                {
+                    group_id: sorted(boundaries)
+                    for group_id, boundaries in sorted(
+                        received_handoff_boundaries.items()
+                    )
+                },
+            )
 
     def _process_retrieve_requests(
         self,

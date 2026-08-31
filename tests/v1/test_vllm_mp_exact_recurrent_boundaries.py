@@ -14,6 +14,8 @@ pytest.importorskip("vllm", reason="MP connector imports vLLM at module load")
 from vllm.v1.core.sched.output import SchedulerOutput  # noqa: E402
 
 # First Party
+import lmcache.integration.vllm.lmcache_mp_connector as connector_mod  # noqa: E402
+import lmcache.integration.vllm.lmcache_mp_metadata as metadata_mod  # noqa: E402
 from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
     LMCacheMPConnector,
     _is_mamba_group_spec,
@@ -204,9 +206,17 @@ def test_exact_store_remains_enabled_after_mixed_recurrent_suppression() -> None
         assert metadata.op.block_ids[group_id] == [0] * 7 + [100 + group_id]
 
 
-def test_connector_ingests_only_exact_handoffs_for_recurrent_groups() -> None:
+def test_connector_ingests_only_exact_handoffs_for_recurrent_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     tracker = _store_tracker(num_chunks=1)
     tracker.state = LMCacheMPRequestState.READY
+    info_messages: list[str] = []
+
+    def spy_info(message: str, *args: object) -> None:
+        info_messages.append(message % args)
+
+    monkeypatch.setattr(connector_mod.logger, "info", spy_info)
     connector = cast(LMCacheMPConnector, object.__new__(LMCacheMPConnector))
     connector.request_trackers = {"known": tracker}
     connector._mamba_group_ids = RECURRENT_GROUP_IDS
@@ -249,6 +259,67 @@ def test_connector_ingests_only_exact_handoffs_for_recurrent_groups() -> None:
         2: {CHUNK_TOKENS: 93},
         3: {CHUNK_TOKENS: 94},
     }
+    assert info_messages == [
+        "Ingested exact recurrent handoffs: request_id=known, "
+        "received_handoff_boundaries={0: [4096], 1: [4096], "
+        "2: [4096], 3: [4096]}"
+    ]
+
+
+def test_store_diagnostic_logs_are_bounded_without_changing_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker = _store_tracker()
+    tracker.exact_mamba_boundary_blocks = {
+        group_id: {CHUNK_TOKENS: 100 + group_id} for group_id in RECURRENT_GROUP_IDS
+    }
+    info_messages: list[str] = []
+
+    def spy_info(message: str, *args: object) -> None:
+        info_messages.append(message % args)
+
+    monkeypatch.setattr(metadata_mod.logger, "info", spy_info)
+
+    metadata = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker,
+        CHUNK_TOKENS,
+        GROUP_TOKENS_PER_BLOCK,
+        RECURRENT_GROUP_IDS,
+    )
+
+    assert metadata is not None
+    assert metadata.op.start == 0
+    assert metadata.op.end == CHUNK_TOKENS
+    assert tracker.num_stored_tokens == CHUNK_TOKENS
+    assert info_messages == [
+        "Truncating recurrent store to handoff-ready prefix: "
+        "request_id=dflash-store, recurrent_groups=[0, 1, 2, 3], "
+        "received_handoff_boundaries={0: [4096], 1: [4096], "
+        "2: [4096], 3: [4096]}, "
+        "required_store_boundaries=[4096, 8192], store_range=[0, 4096), "
+        "reason=later exact recurrent boundary unavailable",
+        "Emitting store metadata: request_id=dflash-store, "
+        "store_range=[0, 4096), "
+        "block_counts_by_group={0: 8, 1: 8, 2: 8, 3: 8, 4: 2, 5: 8}",
+    ]
+
+    suppressed_metadata = LMCacheMPRequestMetadata.GetStoreMetadata(
+        tracker,
+        CHUNK_TOKENS,
+        GROUP_TOKENS_PER_BLOCK,
+        RECURRENT_GROUP_IDS,
+    )
+
+    assert suppressed_metadata is None
+    assert tracker.num_stored_tokens == CHUNK_TOKENS
+    assert info_messages[-1] == (
+        "Suppressing recurrent store: request_id=dflash-store, "
+        "recurrent_groups=[0, 1, 2, 3], "
+        "received_handoff_boundaries={0: [4096], 1: [4096], "
+        "2: [4096], 3: [4096]}, required_store_boundaries=[8192], "
+        "reason=no contiguous exact recurrent boundary"
+    )
+    assert len(info_messages) == 3
 
 
 def test_connector_retains_new_request_handoff_before_first_store() -> None:
