@@ -161,6 +161,15 @@ def _iter_kv_cache_specs(kv_cache_config: "KVCacheConfig | None") -> Iterable[An
             yield group_spec
 
 
+def _is_mamba_group_spec(spec: object) -> bool:
+    """Return whether a resolved KV group contains recurrent Mamba state."""
+    per_layer_specs = getattr(spec, "kv_cache_specs", None)
+    specs = per_layer_specs.values() if isinstance(per_layer_specs, dict) else (spec,)
+    return any(
+        any(cls.__name__ == "MambaSpec" for cls in type(item).__mro__) for item in specs
+    )
+
+
 def _has_recurrent_cache(kv_cache_config: "KVCacheConfig | None") -> bool:
     """Return whether the resolved cache contains recurrent-state pages."""
     if kv_cache_config is None:
@@ -168,8 +177,7 @@ def _has_recurrent_cache(kv_cache_config: "KVCacheConfig | None") -> bool:
     if bool(getattr(kv_cache_config, "has_mamba_layers", False)):
         return True
     return any(
-        any(cls.__name__ == "MambaSpec" for cls in type(spec).__mro__)
-        for spec in _iter_kv_cache_specs(kv_cache_config)
+        _is_mamba_group_spec(spec) for spec in _iter_kv_cache_specs(kv_cache_config)
     )
 
 
@@ -663,6 +671,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # the engine's base block size when no group metadata is available
         # (single non-hybrid group).
         self._group_tokens_per_block = group_tokens_per_block
+        self._mamba_group_ids = {
+            group_idx
+            for group_idx, group in enumerate(
+                getattr(kv_cache_config, "kv_cache_groups", ())
+            )
+            if _is_mamba_group_spec(group.kv_cache_spec)
+        }
         for engine_group_idx, tokens_per_block in enumerate(
             self._group_tokens_per_block
         ):
@@ -1255,6 +1270,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = LMCacheMPConnectorMetadata()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
 
+        self._ingest_exact_mamba_boundary_blocks(scheduler_output)
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
@@ -1410,6 +1426,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     ##############################
     # Helper functions
     ##############################
+    def _ingest_exact_mamba_boundary_blocks(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Record exact core-selected recurrent blocks for later stores."""
+        handoffs = getattr(scheduler_output, "partial_tail_offloads", None) or {}
+        for request_id, entries in handoffs.items():
+            tracker = self.request_trackers.get(request_id)
+            if tracker is None:
+                continue
+            for group_id, block_id, boundary_tokens in entries:
+                if group_id not in self._mamba_group_ids or block_id <= 0:
+                    continue
+                tracker.exact_mamba_boundary_blocks.setdefault(group_id, {})[
+                    boundary_tokens
+                ] = block_id
+
     def _process_retrieve_requests(
         self,
         metadata: LMCacheMPConnectorMetadata,
@@ -1445,6 +1477,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                self._mamba_group_ids,
             )
             if r_meta is not None:
                 # In lazy_offload mode, add to pending queue instead of immediate store
@@ -1485,6 +1518,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                self._mamba_group_ids,
             )
 
             if r_meta is not None:

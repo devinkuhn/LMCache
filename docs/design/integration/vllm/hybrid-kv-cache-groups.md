@@ -141,6 +141,23 @@ store is skipped and nothing is committed — a later retrieve simply misses and
 the engine recomputes. The non-GPU transfer path rejects multi-group transfers
 outright.
 
+### Exact recurrent boundaries
+
+Align-mode recurrent block tables are sparse and mutable, so their positional
+entries are not authoritative store sources. vLLM core hands the connector the
+exact committed block for each LMCache chunk boundary. The scheduler records
+those handoffs by request, engine group, and boundary token count, then replaces
+the recurrent group’s positional IDs before emitting a store.
+
+The raw transfer shape remains unchanged: a recurrent group with 512-token
+blocks and a 4096-token LMCache chunk receives eight IDs per chunk. The first
+seven are null-block placeholders and the final ID is the exact boundary block.
+This lets grouped atomic-store validation retain its full-coverage invariant
+while the all-null-chunk logic continues to reject invalid recurrent objects.
+If any boundary needed by a store has no exact handoff, the connector emits no
+store and retries after a later scheduler step rather than caching a stale
+positional state.
+
 ## Example
 
 vLLM exposes two engine groups — group 0: layers [0,2,4], group 1: [1,3]. If

@@ -58,6 +58,10 @@ class LMCacheMPRequestTracker:
     # during generation. Keyed by engine_group_idx; non-HMA models use 0.
     allocated_block_ids: dict[int, list[int]] = field(default_factory=dict)
 
+    # Exact core-issued recurrent boundary states, keyed by engine group and
+    # boundary token count. Positional align-mode tables are sparse and mutable.
+    exact_mamba_boundary_blocks: dict[int, dict[int, int]] = field(default_factory=dict)
+
     # Number of scheduled tokens in this request. We keep tracking this to
     # avoid saving tokens whose KV has not been computed yet.
     num_scheduled_tokens: int = 0
@@ -84,6 +88,7 @@ class LMCacheMPRequestTracker:
         self.cache_salt: str = request.cache_salt or ""
         self.all_token_ids = request.all_token_ids
         self.allocated_block_ids = {}
+        self.exact_mamba_boundary_blocks = {}
         self.num_stored_tokens = 0
         self.num_vllm_hit_tokens = 0
         self.num_lmcache_hit_tokens = 0
@@ -179,6 +184,56 @@ class LMCacheMPRequestTracker:
         return self.__repr__()
 
 
+def apply_exact_mamba_store_blocks(
+    tracker: LMCacheMPRequestTracker,
+    block_ids: list[list[int]],
+    group_tokens_per_block: list[int],
+    mamba_group_ids: set[int],
+    lmcache_tokens_per_chunk: int,
+    start_token_idx: int,
+    end_token_idx: int,
+) -> bool:
+    """Replace positional recurrent source IDs with exact core handoffs.
+
+    The consolidated transfer path requires a full raw block table for every
+    chunk. Recurrent chunks therefore contain null placeholders followed by
+    the one exact boundary block selected by vLLM core.
+
+    Args:
+        tracker: Request tracker carrying exact blocks by group and boundary.
+        block_ids: Per-group positional block IDs to replace in place.
+        group_tokens_per_block: Token span of one raw block in each group.
+        mamba_group_ids: Engine group IDs containing recurrent state.
+        lmcache_tokens_per_chunk: Token span of one LMCache object chunk.
+        start_token_idx: Inclusive start of the store range.
+        end_token_idx: Exclusive end of the store range.
+
+    Returns:
+        True after replacing every recurrent group. False without mutation
+        when any required exact boundary handoff is absent.
+    """
+    replacements: dict[int, list[int]] = {}
+    for group_id in mamba_group_ids:
+        exact_boundaries = tracker.exact_mamba_boundary_blocks.get(group_id, {})
+        blocks_per_chunk = lmcache_tokens_per_chunk // group_tokens_per_block[group_id]
+        replacement: list[int] = []
+        for boundary_tokens in range(
+            start_token_idx + lmcache_tokens_per_chunk,
+            end_token_idx + 1,
+            lmcache_tokens_per_chunk,
+        ):
+            exact_block_id = exact_boundaries.get(boundary_tokens)
+            if exact_block_id is None:
+                return False
+            replacement.extend([0] * (blocks_per_chunk - 1))
+            replacement.append(exact_block_id)
+        replacements[group_id] = replacement
+
+    for group_id, replacement in replacements.items():
+        block_ids[group_id] = replacement
+    return True
+
+
 @dataclass
 class LMCacheMPRequestMetadata:
     request_id: str
@@ -191,6 +246,7 @@ class LMCacheMPRequestMetadata:
         tracker: LMCacheMPRequestTracker,
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
+        mamba_group_ids: set[int] | None = None,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -202,6 +258,8 @@ class LMCacheMPRequestMetadata:
                 paged chunk (one block ID) of that group, i.e. the group's
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+            mamba_group_ids: Engine groups whose positional block tables must
+                be replaced by exact recurrent-boundary handoffs.
         """
         num_engine_groups = len(group_tokens_per_block)
         # NOTE: the invariant here is that `num_stored_tokens` should
@@ -259,6 +317,18 @@ class LMCacheMPRequestMetadata:
                 start_token_idx,
                 end_token_idx,
             )
+            if mamba_group_ids and not apply_exact_mamba_store_blocks(
+                tracker,
+                block_ids,
+                group_tokens_per_block,
+                mamba_group_ids,
+                lmcache_tokens_per_chunk,
+                start_token_idx,
+                end_token_idx,
+            ):
+                # The core handoff may arrive in a later scheduler step.
+                # Never fall back to a stale positional recurrent state.
+                return None
             token_ids = tracker.get_token_ids()
             op = LoadStoreOp(
                 token_ids=token_ids,
