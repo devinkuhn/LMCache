@@ -10,12 +10,16 @@ import pytest
 
 pytest.importorskip("vllm", reason="MP connector imports vLLM at module load")
 
+# Third Party
+from vllm.v1.core.sched.output import SchedulerOutput  # noqa: E402
+
 # First Party
 from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
     LMCacheMPConnector,
     _is_mamba_group_spec,
 )
 from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
+    LMCacheMPConnectorMetadata,
     LMCacheMPRequestMetadata,
     LMCacheMPRequestState,
     LMCacheMPRequestTracker,
@@ -187,11 +191,11 @@ def test_connector_ingests_only_exact_handoffs_for_recurrent_group() -> None:
         },
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
-            req_ids=[],
-            new_block_ids=[],
-            resumed_req_ids=[],
+            req_ids=["known"],
+            new_block_ids=[None],
+            resumed_req_ids={"known"},
         ),
-        num_scheduled_tokens={},
+        num_scheduled_tokens={"known": 0},
         total_num_scheduled_tokens=0,
         preempted_req_ids=[],
     )
@@ -201,3 +205,49 @@ def test_connector_ingests_only_exact_handoffs_for_recurrent_group() -> None:
     assert tracker.exact_mamba_boundary_blocks == {
         RECURRENT_GROUP_ID: {CHUNK_TOKENS: 91}
     }
+
+
+def test_connector_retains_new_request_handoff_before_first_store() -> None:
+    tracker = _store_tracker(num_chunks=1)
+    tracker.num_scheduled_tokens = 0
+
+    class NewRequestConnector(LMCacheMPConnector):
+        def _process_new_requests(
+            self,
+            scheduler_output: SchedulerOutput,
+            metadata: LMCacheMPConnectorMetadata,
+        ) -> None:
+            self.request_trackers["new-request"] = tracker
+            super()._process_new_requests(scheduler_output, metadata)
+
+    connector = cast(NewRequestConnector, object.__new__(NewRequestConnector))
+    connector.request_trackers = {}
+    connector._mamba_group_ids = {RECURRENT_GROUP_ID}
+    connector._group_tokens_per_block = GROUP_TOKENS_PER_BLOCK
+    connector.lazy_offload = False
+    connector.scheduler_adapter = SimpleNamespace(  # type: ignore[assignment]
+        lmcache_tokens_per_chunk=CHUNK_TOKENS,
+        report_block_allocations=lambda records: None,
+    )
+    scheduler_output = SimpleNamespace(
+        partial_tail_offloads={"new-request": [(RECURRENT_GROUP_ID, 91, CHUNK_TOKENS)]},
+        scheduled_new_reqs=[SimpleNamespace(req_id="new-request")],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[],
+            new_block_ids=[],
+            resumed_req_ids=[],
+        ),
+        num_scheduled_tokens={"new-request": CHUNK_TOKENS},
+        total_num_scheduled_tokens=CHUNK_TOKENS,
+        preempted_req_ids=[],
+    )
+
+    metadata = connector.build_connector_meta(cast(SchedulerOutput, scheduler_output))
+
+    assert isinstance(metadata, LMCacheMPConnectorMetadata)
+    assert tracker.exact_mamba_boundary_blocks == {
+        RECURRENT_GROUP_ID: {CHUNK_TOKENS: 91}
+    }
+    assert len(metadata.requests) == 1
+    assert metadata.requests[0].direction == "STORE"
+    assert metadata.requests[0].op.block_ids[RECURRENT_GROUP_ID] == [0] * 7 + [91]

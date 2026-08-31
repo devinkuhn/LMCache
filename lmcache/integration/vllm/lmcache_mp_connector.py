@@ -1270,7 +1270,6 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = LMCacheMPConnectorMetadata()
         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
 
-        self._ingest_exact_mamba_boundary_blocks(scheduler_output)
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
@@ -1426,21 +1425,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     ##############################
     # Helper functions
     ##############################
-    def _ingest_exact_mamba_boundary_blocks(
-        self, scheduler_output: SchedulerOutput
+    def _ingest_exact_mamba_boundary_blocks_for_request(
+        self,
+        scheduler_output: SchedulerOutput,
+        request_id: str,
+        tracker: LMCacheMPRequestTracker,
     ) -> None:
-        """Record exact core-selected recurrent blocks for later stores."""
+        """Record one request's exact core-selected recurrent blocks."""
         handoffs = getattr(scheduler_output, "partial_tail_offloads", None) or {}
-        for request_id, entries in handoffs.items():
-            tracker = self.request_trackers.get(request_id)
-            if tracker is None:
+        for group_id, block_id, boundary_tokens in handoffs.get(request_id, ()):
+            if group_id not in self._mamba_group_ids or block_id <= 0:
                 continue
-            for group_id, block_id, boundary_tokens in entries:
-                if group_id not in self._mamba_group_ids or block_id <= 0:
-                    continue
-                tracker.exact_mamba_boundary_blocks.setdefault(group_id, {})[
-                    boundary_tokens
-                ] = block_id
+            tracker.exact_mamba_boundary_blocks.setdefault(group_id, {})[
+                boundary_tokens
+            ] = block_id
 
     def _process_retrieve_requests(
         self,
@@ -1469,6 +1467,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         for new_request in scheduler_output.scheduled_new_reqs:
             request_tracker = self._get_request_tracker(new_request.req_id)
+            self._ingest_exact_mamba_boundary_blocks_for_request(
+                scheduler_output,
+                new_request.req_id,
+                request_tracker,
+            )
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
@@ -1503,6 +1506,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for idx, request_id in enumerate(cached_reqs.req_ids):
             request_tracker = self._get_request_tracker(request_id)
+            self._ingest_exact_mamba_boundary_blocks_for_request(
+                scheduler_output,
+                request_id,
+                request_tracker,
+            )
 
             # Update block ids
             new_block_ids = cached_reqs.new_block_ids[idx] or ()
