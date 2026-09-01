@@ -344,7 +344,7 @@ class LMCacheMPRequestMetadata:
                         break
                     end_token_idx = boundary_tokens
                 if end_token_idx == start_token_idx:
-                    logger.info(
+                    logger.debug(
                         "Suppressing recurrent store: request_id=%s, "
                         "recurrent_groups=%s, received_handoff_boundaries=%s, "
                         "required_store_boundaries=%s, reason=no contiguous "

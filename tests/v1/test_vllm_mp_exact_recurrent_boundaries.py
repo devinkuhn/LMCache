@@ -295,11 +295,16 @@ def test_store_diagnostic_logs_are_bounded_without_changing_ranges(
         group_id: {CHUNK_TOKENS: 100 + group_id} for group_id in RECURRENT_GROUP_IDS
     }
     info_messages: list[str] = []
+    debug_messages: list[str] = []
 
     def spy_info(message: str, *args: object) -> None:
         info_messages.append(message % args)
 
+    def spy_debug(message: str, *args: object) -> None:
+        debug_messages.append(message % args)
+
     monkeypatch.setattr(metadata_mod.logger, "info", spy_info)
+    monkeypatch.setattr(metadata_mod.logger, "debug", spy_debug)
 
     metadata = LMCacheMPRequestMetadata.GetStoreMetadata(
         tracker,
@@ -333,14 +338,24 @@ def test_store_diagnostic_logs_are_bounded_without_changing_ranges(
 
     assert suppressed_metadata is None
     assert tracker.num_stored_tokens == CHUNK_TOKENS
-    assert info_messages[-1] == (
+    assert info_messages == [
+        "Truncating recurrent store to handoff-ready prefix: "
+        "request_id=dflash-store, recurrent_groups=[0, 1, 2, 3], "
+        "received_handoff_boundaries={0: [4096], 1: [4096], "
+        "2: [4096], 3: [4096]}, "
+        "required_store_boundaries=[4096, 8192], store_range=[0, 4096), "
+        "reason=later exact recurrent boundary unavailable",
+        "Emitting store metadata: request_id=dflash-store, "
+        "store_range=[0, 4096), "
+        "block_counts_by_group={0: 8, 1: 8, 2: 8, 3: 8, 4: 2, 5: 8}",
+    ]
+    assert debug_messages == [
         "Suppressing recurrent store: request_id=dflash-store, "
         "recurrent_groups=[0, 1, 2, 3], "
         "received_handoff_boundaries={0: [4096], 1: [4096], "
         "2: [4096], 3: [4096]}, required_store_boundaries=[8192], "
         "reason=no contiguous exact recurrent boundary"
-    )
-    assert len(info_messages) == 3
+    ]
 
 
 def test_connector_retains_new_request_handoff_before_first_store() -> None:
