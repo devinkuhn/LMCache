@@ -817,7 +817,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ]
             for iid in stale_ids:
                 reaped.append((iid, self._cache_contexts.pop(iid)))
-        reaped_ids: list[int] = []
+        reaped_ids = [iid for iid, _entry in reaped]
         entries: list[ContextEntry] = []
         for iid, e in reaped:
             logger.warning(
@@ -826,13 +826,32 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 now - e.last_seen,
                 e.has_liveness_signal,
             )
-            reaped_ids.append(iid)
             entries.append(e)
         if reaped:
-            del e  # a bound name would pin the final entry (see _release_entries)
+            del e
             reaped.clear()
-            self._release_entries(entries)
+            try:
+                self._release_entries(entries)
+            except BaseException:
+                if entries:
+                    with self._lock:
+                        for iid, entry in zip(reaped_ids, entries, strict=True):
+                            self._cache_contexts.setdefault(iid, entry)
+                raise
         return reaped_ids
+
+    def _finalize_cuda_cleanup(self, close_errors: list[BaseException]) -> None:
+        """Collect dropped allocations without resetting reusable contexts."""
+        try:
+            torch_dev.empty_cache()
+        except BaseException as exc:
+            close_errors.append(exc)
+        ipc_collect = getattr(torch_dev, "ipc_collect", None)
+        if ipc_collect is not None:
+            try:
+                ipc_collect()
+            except BaseException as exc:
+                close_errors.append(exc)
 
     def _release_entries(self, entries: list[ContextEntry]) -> None:
         """Release a batch of entries and reclaim their device memory.
@@ -843,20 +862,34 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         if not entries:
             return
+        close_errors: list[BaseException] = []
         for entry in entries:
-            entry.cache_context.close()
-            self._ctx.layout_desc_registry.unregister(
-                entry.model_name, entry.world_size
-            )
+            try:
+                entry.cache_context.close()
+            except BaseException as exc:
+                close_errors.append(exc)
+                continue
+            try:
+                self._ctx.layout_desc_registry.unregister(
+                    entry.model_name, entry.world_size
+                )
+            except BaseException as exc:
+                close_errors.append(exc)
+        if close_errors:
+            self._finalize_cuda_cleanup(close_errors)
+            raise RuntimeError(
+                f"GPU cache context cleanup failed with "
+                f"{len(close_errors)} cleanup error(s)"
+            ) from close_errors[0]
+
         del entry
         entries.clear()
-        # ipc_collect() only unmaps a CUDA-IPC-imported segment once its last
-        # tensor reference is gone (LMCache#4014), hence the clear() above.
-        torch_dev.empty_cache()
-        ipc_collect = getattr(torch_dev, "ipc_collect", None)
-        if ipc_collect is not None:
-            # Backends without IPC collection omit this optional operation.
-            ipc_collect()
+        self._finalize_cuda_cleanup(close_errors)
+        if close_errors:
+            raise RuntimeError(
+                f"GPU cache context cleanup failed with "
+                f"{len(close_errors)} cleanup error(s)"
+            ) from close_errors[0]
 
     def get_handlers(self) -> list[HandlerSpec]:
         """Return handler specs for all request types this module serves.
@@ -895,6 +928,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             A dict containing registered GPU instance IDs and
             per-instance KV cache layout metadata.
         """
+        # First Party
+        from lmcache.v1.platform.cuda.cumem_ipc import (
+            imported_alias_refcount_total,
+            imported_registration_count,
+        )
+
         registered_gpu_ids: list[int] = []
         cache_context_meta: dict[str, dict] = {}
 
@@ -910,6 +949,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         return {
             "registered_gpu_ids": registered_gpu_ids,
             "cache_context_meta": cache_context_meta,
+            "imported_cumem_allocation_count": imported_registration_count(),
+            "imported_cumem_alias_refcount": imported_alias_refcount_total(),
         }
 
     def close(self) -> None:
@@ -961,51 +1002,99 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     "Instance %d already registered; refreshing liveness",
                     instance_id,
                 )
+                close_errors: list[BaseException] = []
+                for wrapper in kv_caches:
+                    try:
+                        wrapper.close()
+                    except BaseException as exc:
+                        close_errors.append(exc)
+                if close_errors:
+                    raise RuntimeError(
+                        "duplicate KV cache registration cleanup failed with "
+                        f"{len(close_errors)} cleanup error(s)"
+                    ) from close_errors[0]
                 return
 
         # Build the context and layout descriptor outside the lock.
-        cache_context = create_cache_context(
-            kv_caches,
-            self._ctx.chunk_size,
-            layout_hints=layout_hints or None,
-            engine_group_infos=engine_group_infos,
-            engine_type=engine_type,
-            separate_object_groups=self._ctx.separate_object_groups,
-            full_sw_kv=self._ctx.full_sw_kv,
-        )
-        kv_groups_manager = cache_context.kv_layer_groups_manager
-        num_object_groups = kv_groups_manager.num_object_groups
-        event_backend = get_event_ipc_backend(cache_context.device)
-        event_backend.check_event_support(cache_context.device)
-        layout_desc = get_layout_desc(
-            cache_context, self._ctx.chunk_size, object_group_id=0
-        )
-        # One layout per object group, also in the single-group case: no
-        # None special-casing downstream (group 0 maps to the merged layout).
-        group_layout_descs = {
-            gid: get_layout_desc(
-                cache_context, self._ctx.chunk_size, object_group_id=gid
+        try:
+            cache_context = create_cache_context(
+                kv_caches,
+                self._ctx.chunk_size,
+                layout_hints=layout_hints or None,
+                engine_group_infos=engine_group_infos,
+                engine_type=engine_type,
+                separate_object_groups=self._ctx.separate_object_groups,
+                full_sw_kv=self._ctx.full_sw_kv,
             )
-            for gid in range(num_object_groups)
-        }
-        attn_desc = kv_groups_manager.get_attn_desc()
-        self._ctx.layout_desc_registry.register(
-            model_name,
-            world_size,
-            layout_desc,
-            attn_desc,
-            group_layout_descs=group_layout_descs,
-        )
+        except BaseException as exc:
+            cleanup_errors: list[BaseException] = [exc]
+            for wrapper in kv_caches:
+                try:
+                    wrapper.close()
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            self._finalize_cuda_cleanup(cleanup_errors)
+            if len(cleanup_errors) == 1:
+                raise
+            raise RuntimeError(
+                "KV cache context construction and cleanup failed with "
+                f"{len(cleanup_errors) - 1} additional cleanup error(s)"
+            ) from exc
 
-        with self._lock:
-            self._cache_contexts[instance_id] = ContextEntry(
-                cache_context=cache_context,
-                model_name=model_name,
-                world_size=world_size,
-                last_seen=now,
-                has_liveness_signal=False,
-                event_backend=event_backend,
+        layout_registered = False
+        try:
+            kv_groups_manager = cache_context.kv_layer_groups_manager
+            num_object_groups = kv_groups_manager.num_object_groups
+            event_backend = get_event_ipc_backend(cache_context.device)
+            event_backend.check_event_support(cache_context.device)
+            layout_desc = get_layout_desc(
+                cache_context, self._ctx.chunk_size, object_group_id=0
             )
+            # One layout per object group, also in the single-group case: no
+            # None special-casing downstream (group 0 maps to the merged layout).
+            group_layout_descs = {
+                gid: get_layout_desc(
+                    cache_context, self._ctx.chunk_size, object_group_id=gid
+                )
+                for gid in range(num_object_groups)
+            }
+            attn_desc = kv_groups_manager.get_attn_desc()
+            self._ctx.layout_desc_registry.register(
+                model_name,
+                world_size,
+                layout_desc,
+                attn_desc,
+                group_layout_descs=group_layout_descs,
+            )
+            layout_registered = True
+
+            with self._lock:
+                self._cache_contexts[instance_id] = ContextEntry(
+                    cache_context=cache_context,
+                    model_name=model_name,
+                    world_size=world_size,
+                    last_seen=now,
+                    has_liveness_signal=False,
+                    event_backend=event_backend,
+                )
+        except BaseException as exc:
+            cleanup_errors = [exc]
+            try:
+                cache_context.close()
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+            self._finalize_cuda_cleanup(cleanup_errors)
+            if layout_registered:
+                try:
+                    self._ctx.layout_desc_registry.unregister(model_name, world_size)
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(cleanup_exc)
+            if len(cleanup_errors) == 1:
+                raise
+            raise RuntimeError(
+                "KV cache registration and cleanup failed with "
+                f"{len(cleanup_errors) - 1} additional cleanup error(s)"
+            ) from exc
 
         logger.info(
             "Registered KV cache for GPU ID %d with %d layers",
@@ -1031,9 +1120,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             )
             return
 
-        # No scalar binding: `popped` must stay the only reference so
-        # _release_entries' reclaim actually unmaps the IPC segments.
-        self._release_entries(popped)
+        # Keep cleanup failures visible and retryable.
+        try:
+            self._release_entries(popped)
+        except BaseException:
+            if popped:
+                with self._lock:
+                    self._cache_contexts.setdefault(instance_id, popped[0])
+            raise
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
     @_lmcache_nvtx_annotate

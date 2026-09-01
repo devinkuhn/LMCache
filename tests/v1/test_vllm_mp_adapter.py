@@ -27,6 +27,8 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.protocol import RequestType
+from lmcache.v1.multiprocess.transfer_context import MPTransferMode
+from lmcache.v1.platform.cuda.cumem_ipc import CuMemIPCUnsupportedError
 from lmcache.v1.platform.isolated_ipc import is_isolated_ipc, set_isolated_ipc
 
 
@@ -215,6 +217,65 @@ def test_register_kv_caches_forwards_explicit_chunk_tokens(
     adapter.register_kv_caches({"layer.0": fake_tensor})
 
     assert contexts[0].register.call_args.kwargs["tokens_per_chunk"] == 256
+
+
+def test_auto_falls_back_before_cumem_registration(fake_adapter, monkeypatch) -> None:
+    """Auto mode retries engine-driven only when cuMem export fails."""
+    adapter, _send_mock, _future = fake_adapter
+    contexts: list[MagicMock] = []
+
+    def create_context(
+        _kv_caches: dict[str, torch.Tensor],
+        mode: str | MPTransferMode | None,
+    ) -> MagicMock:
+        context = MagicMock(name=f"context-{len(contexts)}")
+        if not contexts:
+            context.register.side_effect = CuMemIPCUnsupportedError("not exportable")
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", create_context)
+    tensor = MagicMock()
+    tensor.device = torch.device("cuda")
+
+    adapter.register_kv_caches({"layer.0": tensor})
+
+    assert len(contexts) == 2
+    contexts[0].close.assert_called_once_with()
+    contexts[1].register.assert_called_once()
+    assert adapter.transfer_ctx is contexts[1]
+
+
+def test_forced_lmcache_driven_cumem_failure_is_closed(
+    fake_adapter, monkeypatch
+) -> None:
+    """Explicit lmcache_driven mode must not silently change transports."""
+    _adapter, _send_mock, _future = fake_adapter
+    adapter = _make_worker_adapter(
+        {"lmcache.mp.mp_transfer_mode": MPTransferMode.LMCACHE_DRIVEN.value}
+    )
+    contexts = _patch_transfer_context_factory(monkeypatch)
+
+    tensor = MagicMock()
+    tensor.device = torch.device("cuda")
+    # Materialize the first context so its registration can fail.
+    original_factory = adapter_mod.create_transfer_context
+
+    def failing_factory(
+        kv_caches: dict[str, torch.Tensor],
+        mode: str | MPTransferMode | None,
+    ) -> MagicMock:
+        context = original_factory(kv_caches, mode)
+        context.register.side_effect = CuMemIPCUnsupportedError("not exportable")
+        return context
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", failing_factory)
+
+    with pytest.raises(CuMemIPCUnsupportedError, match="not exportable"):
+        adapter.register_kv_caches({"layer.0": tensor})
+
+    assert len(contexts) == 1
+    contexts[0].close.assert_not_called()
 
 
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
@@ -937,12 +998,12 @@ def test_startup_does_not_warn_for_default_heartbeat_interval(
     assert not any("reap" in msg for msg in warnings)
 
 
-def test_recover_callback_rebuilds_transfer_ctx_without_closing_previous(
+def test_recover_callback_closes_superseded_transfer_ctx(
     fake_adapter, monkeypatch
 ) -> None:
-    """Pin current behavior: every recover-callback invocation rebuilds
-    ``transfer_ctx`` without closing the previous context (known IPC leak;
-    in-flight submissions may still hold a reference to the old context)."""
+    """Successful recover closes the superseded transfer context after
+    replacement; a failed recover leaves the still-active context open.
+    Repeated successful recovers close each superseded context once."""
     adapter, _send_mock, _ = fake_adapter
     contexts = _patch_transfer_context_factory(monkeypatch)
 
@@ -955,19 +1016,32 @@ def test_recover_callback_rebuilds_transfer_ctx_without_closing_previous(
     assert heartbeat.recover_callback is not None
     assert len(contexts) == 1
     assert adapter.transfer_ctx is contexts[0]
-
-    # Each recover-callback invocation rebuilds transfer_ctx without closing
-    # the previous context (known IPC leak; in-flight submissions may still
-    # hold a reference to the old context).
-    assert heartbeat.recover_callback() is True
-    assert len(contexts) == 2
-    assert adapter.transfer_ctx is contexts[1]
     contexts[0].close.assert_not_called()
 
     assert heartbeat.recover_callback() is True
-    assert len(contexts) == 3
-    assert adapter.transfer_ctx is contexts[2]
+    assert len(contexts) == 2
+    assert adapter.transfer_ctx is contexts[1]
+    contexts[0].close.assert_called_once_with()
     contexts[1].close.assert_not_called()
+
+    original_factory = adapter_mod.create_transfer_context
+
+    def failing_register(kv_caches: dict[str, torch.Tensor], mode: str) -> MagicMock:
+        ctx = original_factory(kv_caches, mode)
+        ctx.register.side_effect = TimeoutError("server down")
+        return ctx
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", failing_register)
+    assert heartbeat.recover_callback() is False
+    assert adapter.transfer_ctx is contexts[1]
+    contexts[1].close.assert_not_called()
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", original_factory)
+    assert heartbeat.recover_callback() is True
+    assert adapter.transfer_ctx is contexts[-1]
+    contexts[0].close.assert_called_once_with()
+    contexts[1].close.assert_called_once_with()
+    contexts[-1].close.assert_not_called()
 
 
 # For the experimental dispatcher

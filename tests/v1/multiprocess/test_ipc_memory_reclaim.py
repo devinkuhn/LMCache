@@ -111,6 +111,23 @@ def test_unregister_reclaims_ipc_memory(monkeypatch) -> None:
     assert module.context_entries_snapshot() == {}
 
 
+def test_unregister_then_reregister_in_same_server(monkeypatch) -> None:
+    """A server process can replace a mapping while retaining its contexts."""
+    dev = _FakeTorchDev()
+    monkeypatch.setattr(gpu_mod, "torch_dev", dev)
+    module = _module(monkeypatch)
+    first = _register(module, monkeypatch, 7)
+
+    module.unregister_kv_cache(7)
+    second = _register(module, monkeypatch, 7)
+
+    first.close.assert_called_once()
+    second.close.assert_not_called()
+    assert list(module.context_entries_snapshot()) == [7]
+    assert dev.calls == ["empty_cache", "ipc_collect"]
+    assert not hasattr(dev, "device_reset")
+
+
 def test_unregister_unknown_instance_does_not_reclaim(monkeypatch) -> None:
     """The warn path (already-reaped / never-registered id) must not touch
     the allocator — reclaim is tied to an actual release."""
