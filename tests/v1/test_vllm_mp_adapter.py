@@ -682,6 +682,62 @@ def test_retrieve_keeps_event_until_future_finishes(fake_adapter):
     assert event_ref() is None
 
 
+def test_finished_sending_dedup_history_is_bounded(fake_adapter) -> None:
+    """Unique completions cannot grow dedup history without limit."""
+    adapter, _send_mock, _future = fake_adapter
+
+    for index in range(65_537):
+        finished_stores, _finished_retrieves = adapter.get_finished({f"req-{index}"})
+        assert finished_stores == {f"req-{index}"}
+
+    assert len(adapter._returned_finished) <= 65_536
+    finished_stores, _finished_retrieves = adapter.get_finished({"req-65536"})
+    assert finished_stores == set()
+
+
+@pytest.mark.parametrize("operation", ["store", "retrieve"])
+def test_unhealthy_adapter_waits_for_submitted_device_completion(
+    fake_adapter,
+    operation: str,
+) -> None:
+    """Health loss does not finish submitted work before its device event."""
+    adapter, _send_mock, _future = fake_adapter
+    completion = threading.Event()
+    entered_result = threading.Event()
+    future = MagicMock()
+    future.query.return_value = True
+
+    def await_completion(timeout: float) -> bool:
+        del timeout
+        entered_result.set()
+        assert completion.wait(timeout=5)
+        return True
+
+    future.result.side_effect = await_completion
+    engine_finished: set[str] = set()
+    if operation == "store":
+        adapter.store_futures["req"] = future
+        engine_finished.add("req")
+    else:
+        adapter.retrieve_futures["req"] = (future, [7])
+    adapter._health_event.clear()
+
+    results: list[tuple[set[str] | None, set[str] | None]] = []
+    worker = threading.Thread(
+        target=lambda: results.append(adapter.get_finished(engine_finished))
+    )
+    worker.start()
+
+    assert entered_result.wait(timeout=5)
+    assert results == []
+    completion.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    expected = ({"req"}, set()) if operation == "store" else (set(), {"req"})
+    assert results == [expected]
+
+
 @pytest.mark.parametrize("lazy_offload", [False, True])
 def test_failed_retrieve_marks_blocks_for_recompute(
     fake_adapter,

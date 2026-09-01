@@ -681,12 +681,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         # empty_cache (leaf-lock invariant: no thread holds two locks).
         self._lock = threading.Lock()
 
-        # Route finish_write / finish_read_prefetched through a C++ host
+        # Route write/read completion through a C++ host
         # callback so the driver thread doesn't acquire the GIL.
         self._device_host_func_dispatcher = DeviceHostFuncDispatcher()
         self._device_host_func_dispatcher.register(
             "finish_write",
             self._ctx.storage_manager.finish_write,
+            payload_type=list[ObjectKey],
+        )
+        self._device_host_func_dispatcher.register(
+            "abort_write",
+            self._ctx.storage_manager.abort_write,
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.register(
@@ -1392,7 +1397,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             finally:
                 event_backend.record_event(event, cache_context.stream)
                 # Fail closed: commit the reserved objects only when every chunk
-                # copied successfully; otherwise the whole store is skipped.
+                # copied successfully; otherwise release every reservation after
+                # any already-enqueued copies stop using their backing memory.
                 stored_count = len(all_dict) if store_succeeded else 0
                 if stored_count:
                     submit_callback_to_stream(
@@ -1402,6 +1408,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
                 else:
                     total_bytes = 0
+                    if all_dict:
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "abort_write",
+                            list(all_dict.keys()),
+                        )
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
@@ -1593,6 +1605,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     num_chunks,
                     blocks_per_chunk,
                 )
+                try:
+                    self._release_failed_retrieve_locks(key, instance_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to release RETRIEVE locks after block ID "
+                        "underflow for request_id=%s",
+                        key.request_id,
+                    )
                 event_backend.record_event(event, cache_context.stream)
                 return event_backend.export_event(event, cache_context.device), False
 

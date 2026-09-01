@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol, cast
@@ -93,6 +94,31 @@ _EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
 # default 10 s heartbeat interval (3 x 10 s); the adapter warns at startup
 # when 3 x heartbeat_interval exceeds it (server timeout must be raised too).
 _SERVER_REAP_TIMEOUT_FLOOR_SECONDS: float = 30.0
+_FINISHED_REQUEST_DEDUP_CAPACITY: int = 65_536
+
+
+class _BoundedRequestIdSet:
+    """Thread-safe bounded FIFO set for recently returned request IDs."""
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._entries: OrderedDict[str, None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def add_if_absent(self, request_id: str) -> bool:
+        """Record an ID if absent, evicting the oldest ID at capacity."""
+        with self._lock:
+            if request_id in self._entries:
+                return False
+            self._entries[request_id] = None
+            while len(self._entries) > self._capacity:
+                self._entries.popitem(last=False)
+            return True
+
+    def __len__(self) -> int:
+        """Return the current number of retained request IDs."""
+        with self._lock:
+            return len(self._entries)
 
 
 def _coerce_extra_config_value(default: Any, raw: Any) -> Any:
@@ -1225,7 +1251,7 @@ class LMCacheMPWorkerAdapter:
         self.previously_finished: set[str] = set()
         # Request IDs already returned as finished_sending to the scheduler.
         # Prevents re-reporting the same ID after drain clears tracking sets.
-        self._returned_finished: set[str] = set()
+        self._returned_finished = _BoundedRequestIdSet(_FINISHED_REQUEST_DEDUP_CAPACITY)
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
@@ -1733,14 +1759,13 @@ class LMCacheMPWorkerAdapter:
         self.finished_stores.update(finished_req_ids_from_lmcache)
         ret_stores = set()
         for req_id in finished_req_ids_from_engine:
-            if req_id in self._returned_finished:
-                continue
             if req_id in self.finished_stores or req_id in self.store_futures:
                 self.previously_finished.add(req_id)
-            else:
+            elif self._returned_finished.add_if_absent(req_id):
                 ret_stores.add(req_id)
-        ret_stores.update(self._update_and_get_finished_store())
-        self._returned_finished.update(ret_stores)
+        for req_id in self._update_and_get_finished_store():
+            if self._returned_finished.add_if_absent(req_id):
+                ret_stores.add(req_id)
         return ret_stores
 
     @_lmcache_nvtx_annotate
@@ -1772,20 +1797,17 @@ class LMCacheMPWorkerAdapter:
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
-        # If unhealthy, drain all pending futures immediately
+        # Health loss blocks new submissions, but submitted futures remain
+        # device-aware and must reach terminal completion before reporting.
         if not self.is_healthy:
-            finished_stores = set(self.store_futures.keys())
-            finished_retrieves = set()
-            for request_id, (
-                _r_future,
-                r_block_ids,
-            ) in self.retrieve_futures.items():
-                finished_retrieves.add(request_id)
-                self.error_block_ids.update(r_block_ids)
-            self.store_futures.clear()
-            self.retrieve_futures.clear()
-            self.store_events.clear()
-            self.retrieve_events.clear()
+            finished_stores = self._poll_store_futures()
+            finished_retrieves = self._poll_retrieve_futures()
+            for request_id in finished_stores:
+                self.store_futures.pop(request_id, None)
+                self.store_events.pop(request_id, None)
+            for request_id in finished_retrieves:
+                self.retrieve_futures.pop(request_id, None)
+                self.retrieve_events.pop(request_id, None)
 
             # Retrieves dropped at submit time still must be reported,
             # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
@@ -1871,20 +1893,17 @@ class LMCacheMPWorkerAdapter:
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
 
-        # If unhealthy, drain all pending futures immediately
+        # Health loss blocks new submissions, but submitted futures remain
+        # device-aware and must reach terminal completion before reporting.
         if not self.is_healthy:
-            finished_stores = set(self.store_futures.keys())
-            finished_retrieves = set()
-            for request_id, (
-                _r_future,
-                r_block_ids,
-            ) in self.retrieve_futures.items():
-                finished_retrieves.add(request_id)
-                self.error_block_ids.update(r_block_ids)
-            self.store_futures.clear()
-            self.retrieve_futures.clear()
-            self.store_events.clear()
-            self.retrieve_events.clear()
+            finished_stores = self._poll_store_futures()
+            finished_retrieves = self._poll_retrieve_futures()
+            for request_id in finished_stores:
+                self.store_futures.pop(request_id, None)
+                self.store_events.pop(request_id, None)
+            for request_id in finished_retrieves:
+                self.retrieve_futures.pop(request_id, None)
+                self.retrieve_events.pop(request_id, None)
 
             # Retrieves dropped at submit time still must be reported,
             # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.

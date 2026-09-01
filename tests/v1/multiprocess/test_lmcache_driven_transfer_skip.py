@@ -92,6 +92,84 @@ def test_object_group_null_only_when_all_its_kernel_groups_null():
     assert masks == [[True, False]]
 
 
+def test_store_aborts_all_groups_when_later_copy_fails(monkeypatch):
+    """A later group failure releases every earlier write reservation."""
+    module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
+    kvlgm = SimpleNamespace(
+        num_object_groups=2,
+        num_kernel_groups=2,
+        object_groups=[_og([0]), _og([1])],
+    )
+    cache_context = MagicMock()
+    cache_context.kv_layer_groups_manager = kvlgm
+    cache_context.calculate_num_blocks.return_value = 1
+    event_backend = MagicMock()
+    entry = ContextEntry(
+        cache_context=cache_context,
+        model_name="m",
+        world_size=1,
+        event_backend=event_backend,
+    )
+    module._cache_contexts = {1: entry}
+    module._lock = threading.Lock()
+
+    ctx = MagicMock()
+    ctx.chunk_size = 256
+    ctx.resolve_obj_keys.return_value = [["g0c0"], ["g1c0"]]
+    memory_objs = {
+        "g0c0": MagicMock(get_size=MagicMock(return_value=10)),
+        "g1c0": MagicMock(get_size=MagicMock(return_value=10)),
+    }
+    ctx.storage_manager.reserve_write.side_effect = lambda keys, *_args: {
+        key: memory_objs[key] for key in keys
+    }
+    module._ctx = ctx
+
+    def fail_second_group(
+        cache_context,
+        block_ids,
+        memory_objs,
+        object_group_id,
+        batch_size,
+        skip_first_n_tokens,
+        direction,
+    ):
+        del (
+            cache_context,
+            block_ids,
+            memory_objs,
+            batch_size,
+            skip_first_n_tokens,
+            direction,
+        )
+        if object_group_id == 1:
+            raise RuntimeError("injected second-group copy failure")
+
+    submitted_callbacks: list[tuple[object, ...]] = []
+    monkeypatch.setattr(mod, "get_layout_desc", lambda *args, **kwargs: object())
+    monkeypatch.setattr(mod, "transfer_kv_per_object_group", fail_second_group)
+    monkeypatch.setattr(mod, "downsample_and_stage_block_ids", lambda cc, b: b)
+    monkeypatch.setattr(
+        mod,
+        "submit_callback_to_stream",
+        lambda *args, **_kwargs: submitted_callbacks.append(args),
+    )
+    monkeypatch.setattr(mod, "torch_dev", MagicMock())
+    monkeypatch.setattr(mod, "Event", MagicMock())
+
+    _handle, ok = module.store(
+        key=SimpleNamespace(request_id="req", worker_id=1),
+        instance_id=1,
+        gpu_block_ids=[[1], [2]],
+        event_ipc_handle=b"x",
+    )
+
+    assert ok is False
+    assert submitted_callbacks == [
+        (cache_context.cupy_stream, "abort_write", ["g0c0", "g1c0"])
+    ]
+
+
 # ------------------------------------------------------------------ #
 #  retrieve (read-side window)                                         #
 # ------------------------------------------------------------------ #
