@@ -3,8 +3,10 @@
 
 # Standard
 from pathlib import Path
+import array
 import os
 import tempfile
+import threading
 
 # Third Party
 import pytest
@@ -279,6 +281,77 @@ def test_broker_transfers_fd_only_under_shared_absolute_root(tmp_path: Path) -> 
                 retry_timeout=0,
             )
     finally:
+        lease.close()
+        broker.close()
+        os.close(fd)
+
+
+def test_broker_send_uses_fd_snapshot_across_final_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A final lease release cannot invalidate an authorized in-flight send."""
+    root = validate_broker_root(tmp_path)
+    broker = CuMemFDBroker(root)
+    fd, path = tempfile.mkstemp(dir=root)
+    os.unlink(path)
+    os.write(fd, b"lease-snapshot")
+    lease = broker.register(("snapshot", 1), fd)
+    send_prepared = threading.Event()
+    allow_send = threading.Event()
+    real_array = cumem_ipc.array.array
+
+    def pause_before_broker_send(
+        typecode: str,
+        initializer: list[int] | bytes | bytearray | None = None,
+    ) -> array.array:
+        result = (
+            real_array(typecode)
+            if initializer is None
+            else real_array(typecode, initializer)
+        )
+        if threading.current_thread().name == "lmcache-cumem-fd-broker" and isinstance(
+            initializer, list
+        ):
+            send_prepared.set()
+            if not allow_send.wait(timeout=5.0):
+                raise TimeoutError("broker send was not released")
+        return result
+
+    monkeypatch.setattr(cumem_ipc.array, "array", pause_before_broker_send)
+    received: list[int] = []
+    errors: list[BaseException] = []
+
+    def receive() -> None:
+        try:
+            received.append(
+                receive_fd(
+                    lease.broker_path,
+                    lease.broker_token,
+                    lease.allocation_id,
+                    broker_root=root,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    receiver = threading.Thread(target=receive)
+    receiver.start()
+    try:
+        assert send_prepared.wait(timeout=5.0)
+        lease.close()
+        allow_send.set()
+        receiver.join(timeout=5.0)
+
+        assert not receiver.is_alive()
+        assert errors == []
+        assert len(received) == 1
+        os.lseek(received[0], 0, os.SEEK_SET)
+        assert os.read(received[0], 64) == b"lease-snapshot"
+    finally:
+        allow_send.set()
+        receiver.join(timeout=5.0)
+        for received_fd in received:
+            os.close(received_fd)
         lease.close()
         broker.close()
         os.close(fd)

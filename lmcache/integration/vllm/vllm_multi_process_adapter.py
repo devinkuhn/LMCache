@@ -1393,11 +1393,7 @@ class LMCacheMPWorkerAdapter:
         previous_transfer_ctx = self.transfer_ctx
         transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
         layout_hints = self._layout_hints
-        self.transfer_ctx = transfer_ctx
         try:
-            # Register on the local, not self.transfer_ctx: a concurrent
-            # shutdown() may null self.transfer_ctx between publish and this
-            # call. The local is always non-None.
             transfer_ctx.register(
                 self.instance_id,
                 kv_caches,
@@ -1417,7 +1413,7 @@ class LMCacheMPWorkerAdapter:
             if resolved_mode is not MPTransferMode.AUTO:
                 # Forced lmcache_driven must fail closed. Engine-driven cannot
                 # produce this exporter-side error.
-                self.transfer_ctx = previous_transfer_ctx
+                transfer_ctx.close()
                 raise
             logger.warning(
                 "cuMem CUDA IPC export is unavailable; falling back to "
@@ -1428,28 +1424,42 @@ class LMCacheMPWorkerAdapter:
                 kv_caches,
                 mode=MPTransferMode.ENGINE_DRIVEN,
             )
-            self.transfer_ctx = transfer_ctx
-            transfer_ctx.register(
-                self.instance_id,
-                kv_caches,
-                self.model_name,
-                self.world_size,
-                self.blocks_in_chunk,
-                self.mq_client,
-                self._mq_timeout,
-                send_request=send_lmcache_request,
-                layout_hints=layout_hints,
-                engine_group_infos=self.engine_group_infos,
-                engine_type=EngineType.VLLM,
-                tokens_per_chunk=self.lmcache_tokens_per_chunk,
-            )
+            try:
+                transfer_ctx.register(
+                    self.instance_id,
+                    kv_caches,
+                    self.model_name,
+                    self.world_size,
+                    self.blocks_in_chunk,
+                    self.mq_client,
+                    self._mq_timeout,
+                    send_request=send_lmcache_request,
+                    layout_hints=layout_hints,
+                    engine_group_infos=self.engine_group_infos,
+                    engine_type=EngineType.VLLM,
+                    tokens_per_chunk=self.lmcache_tokens_per_chunk,
+                )
+            except TimeoutError:
+                transfer_ctx.close()
+                raise ConnectionError(
+                    "LMCache server did not respond to "
+                    "register_kv_caches within "
+                    f"{self._mq_timeout}s. Is the server running?"
+                ) from None
+            except BaseException:
+                transfer_ctx.close()
+                raise
         except TimeoutError:
-            self.transfer_ctx = previous_transfer_ctx
+            transfer_ctx.close()
             raise ConnectionError(
                 "LMCache server did not respond to "
                 "register_kv_caches within "
                 f"{self._mq_timeout}s. Is the server running?"
             ) from None
+        except BaseException:
+            transfer_ctx.close()
+            raise
+        self.transfer_ctx = transfer_ctx
         if (
             previous_transfer_ctx is not None
             and previous_transfer_ctx is not transfer_ctx

@@ -12,11 +12,13 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+import threading
 
 # First Party
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as mod
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
+    ContextEntry,
     LMCacheDrivenTransferModule,
     all_null_chunk_masks,
 )
@@ -116,10 +118,14 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw, group_kinds=()):
     cache_context.max_batch_size = 8
 
     event_backend = MagicMock()
-    entry = SimpleNamespace(
-        cache_context=cache_context, model_name="m", event_backend=event_backend
+    entry = ContextEntry(
+        cache_context=cache_context,
+        model_name="m",
+        world_size=1,
+        event_backend=event_backend,
     )
-    module.get_and_touch_context_entry = MagicMock(return_value=entry)
+    module._cache_contexts = {1: entry}
+    module._lock = threading.Lock()
 
     # Object keys: one distinct key per (group, chunk).
     obj_keys = [

@@ -5,6 +5,7 @@
 from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+import threading
 
 # Third Party
 import pytest
@@ -89,10 +90,9 @@ def test_missing_registration_returns_terminal_false(method_name: str) -> None:
     handle indicates that the server submitted no device work.
     """
     module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
-    module.get_and_touch_context_entry = MagicMock(  # type: ignore[method-assign]
-        return_value=None
-    )
     module._ctx = MagicMock()
+    module._cache_contexts = {}
+    module._lock = threading.Lock()
     module._ctx.session_manager.get.return_value = None
     producer_event = b"worker-producer-event"
     key = _cache_key(world_size=1, worker_id=0, request_id="request")
@@ -105,7 +105,7 @@ def test_missing_registration_returns_terminal_false(method_name: str) -> None:
     )
 
     assert result == (b"", False)
-    module.get_and_touch_context_entry.assert_called_once_with(42)
+    assert module.tracked_instance_count() == 0
 
 
 @pytest.mark.parametrize("mla", [False, True], ids=["sharded-kv", "mla-shared-kv"])
@@ -161,9 +161,8 @@ def test_tp_failed_worker_releases_only_its_reader_share_once(mla: bool) -> None
 
     module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
     module._ctx = ctx  # type: ignore[assignment]
-    module.get_and_touch_context_entry = MagicMock(  # type: ignore[method-assign]
-        return_value=None
-    )
+    module._cache_contexts = {}
+    module._lock = threading.Lock()
     failed_key = _cache_key(
         world_size=world_size,
         worker_id=failed_worker,
@@ -208,10 +207,9 @@ def test_tp_failed_worker_releases_only_its_reader_share_once(mla: bool) -> None
 def test_cleanup_exception_does_not_suppress_terminal_false() -> None:
     """A resolution failure must not consume the claim or strand the caller."""
     module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
-    module.get_and_touch_context_entry = MagicMock(  # type: ignore[method-assign]
-        return_value=None
-    )
     module._ctx = MagicMock()
+    module._cache_contexts = {}
+    module._lock = threading.Lock()
     session = MagicMock()
     session.prepare_failed_retrieve_release.return_value = (2, (0,), (-1,), 7)
     module._ctx.session_manager.get.return_value = session

@@ -330,7 +330,7 @@ def test_forced_lmcache_driven_cumem_failure_is_closed(
         adapter.register_kv_caches({"layer.0": tensor})
 
     assert len(contexts) == 1
-    contexts[0].close.assert_not_called()
+    contexts[0].close.assert_called_once_with()
 
 
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
@@ -342,6 +342,103 @@ def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
         fake_tensor = MagicMock()
         fake_tensor.device.type = "cuda"
         adapter.register_kv_caches({"layer.0": fake_tensor})
+
+
+def test_register_generic_failure_restores_previous_and_closes_new(
+    fake_adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generic registration failure keeps the live context and drops the new one."""
+    adapter, _send_mock, _future = fake_adapter
+    previous = MagicMock(name="previous_transfer_ctx")
+    adapter.transfer_ctx = previous
+    contexts = _patch_transfer_context_factory(monkeypatch)
+    tensor = MagicMock()
+    tensor.device = torch.device("cuda")
+
+    def fail_registration(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("registration failed")
+
+    original_factory = adapter_mod.create_transfer_context
+
+    def failing_factory(
+        kv_caches: dict[str, torch.Tensor],
+        mode: str | MPTransferMode | None,
+    ) -> MagicMock:
+        context = original_factory(kv_caches, mode)
+        context.register.side_effect = fail_registration
+        return context
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", failing_factory)
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        adapter.register_kv_caches({"layer.0": tensor})
+
+    assert adapter.transfer_ctx is previous
+    contexts[0].close.assert_called_once_with()
+    previous.close.assert_not_called()
+
+
+def test_register_timeout_restores_previous_and_closes_new(
+    fake_adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registration timeout preserves the prior context without leaking leases."""
+    adapter, _send_mock, _future = fake_adapter
+    previous = MagicMock(name="previous_transfer_ctx")
+    adapter.transfer_ctx = previous
+    contexts = _patch_transfer_context_factory(monkeypatch)
+    tensor = MagicMock()
+    tensor.device = torch.device("cuda")
+    contexts_factory = adapter_mod.create_transfer_context
+
+    def timeout_factory(
+        kv_caches: dict[str, torch.Tensor],
+        mode: str | MPTransferMode | None,
+    ) -> MagicMock:
+        context = contexts_factory(kv_caches, mode)
+        context.register.side_effect = TimeoutError("server down")
+        return context
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", timeout_factory)
+
+    with pytest.raises(ConnectionError, match="did not respond"):
+        adapter.register_kv_caches({"layer.0": tensor})
+
+    assert adapter.transfer_ctx is previous
+    contexts[0].close.assert_called_once_with()
+    previous.close.assert_not_called()
+
+
+def test_successful_registration_publishes_then_closes_previous(
+    fake_adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement remains private until registration succeeds."""
+    adapter, _send_mock, _future = fake_adapter
+    previous = MagicMock(name="previous_transfer_ctx")
+    adapter.transfer_ctx = previous
+    contexts = _patch_transfer_context_factory(monkeypatch)
+    tensor = MagicMock()
+    tensor.device = torch.device("cuda")
+
+    def observe_registration(*_args: object, **_kwargs: object) -> None:
+        assert adapter.transfer_ctx is previous
+
+    contexts_factory = adapter_mod.create_transfer_context
+
+    def observing_factory(
+        kv_caches: dict[str, torch.Tensor],
+        mode: str | MPTransferMode | None,
+    ) -> MagicMock:
+        context = contexts_factory(kv_caches, mode)
+        context.register.side_effect = observe_registration
+        return context
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", observing_factory)
+
+    adapter.register_kv_caches({"layer.0": tensor})
+
+    assert adapter.transfer_ctx is contexts[0]
+    contexts[0].close.assert_not_called()
+    previous.close.assert_called_once_with()
 
 
 def test_register_kv_caches_cpu_submits_engine_driven_context_registration(

@@ -344,12 +344,15 @@ class CuMemFDBroker:
                         saved = self._by_id.get(allocation_id)
                         if saved is None or not secrets.compare_digest(saved[0], token):
                             continue
-                        fd = saved[1]
-                    rights = array.array("i", [fd])
-                    conn.sendmsg(
-                        [b"F"],
-                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
-                    )
+                        fd = os.dup(saved[1])
+                    try:
+                        rights = array.array("i", [fd])
+                        conn.sendmsg(
+                            [b"F"],
+                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+                        )
+                    finally:
+                        os.close(fd)
                 except (KeyError, ValueError, OSError, json.JSONDecodeError):
                     continue
 
