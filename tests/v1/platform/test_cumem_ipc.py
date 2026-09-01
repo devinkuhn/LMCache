@@ -5,6 +5,7 @@
 from pathlib import Path
 import array
 import os
+import socket
 import tempfile
 import threading
 
@@ -284,6 +285,38 @@ def test_broker_transfers_fd_only_under_shared_absolute_root(tmp_path: Path) -> 
         lease.close()
         broker.close()
         os.close(fd)
+
+
+def test_stale_broker_socket_removed_when_filename_pid_is_live(
+    tmp_path: Path,
+) -> None:
+    """An unreachable stale socket is removed despite a recycled live PID."""
+    root = validate_broker_root(tmp_path)
+    stale_path = root / f"lmcu-{os.getpid()}-deadbeef.sock"
+    stale_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale_socket.bind(str(stale_path))
+    stale_socket.listen()
+    stale_socket.close()
+
+    broker = CuMemFDBroker(root)
+    try:
+        assert not stale_path.exists()
+    finally:
+        broker.close()
+
+
+def test_live_broker_socket_survives_peer_cleanup(tmp_path: Path) -> None:
+    """A reachable same-UID broker socket is never removed as stale."""
+    root = validate_broker_root(tmp_path)
+    live_broker = CuMemFDBroker(root)
+    try:
+        peer_broker = CuMemFDBroker(root)
+        try:
+            assert Path(live_broker.path).exists()
+        finally:
+            peer_broker.close()
+    finally:
+        live_broker.close()
 
 
 def test_broker_send_uses_fd_snapshot_across_final_release(

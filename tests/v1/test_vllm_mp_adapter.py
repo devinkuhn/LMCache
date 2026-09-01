@@ -67,6 +67,8 @@ class FakeHeartbeatThread:
         # "start", "stop") for call-order assertions.
         self.calls: list[str] = []
         self.stop_requested = False
+        self._recoveries_inflight = 0
+        self._recovery_condition = threading.Condition()
         FakeHeartbeatThread.instances.append(self)
 
     def register_recover_callback(self, callback: Callable[[], bool]) -> None:
@@ -84,6 +86,25 @@ class FakeHeartbeatThread:
     def stop(self, timeout: float = 5.0) -> None:
         self.calls.append("stop")
         self.stop_requested = True
+
+    def stop_and_wait(self) -> None:
+        """Stop and wait for an in-progress recovery callback."""
+        self.stop()
+        with self._recovery_condition:
+            self._recovery_condition.wait_for(lambda: self._recoveries_inflight == 0)
+
+    def recover(self) -> bool:
+        """Run the registered recovery callback as a heartbeat cycle would."""
+        if self.recover_callback is None:
+            return True
+        with self._recovery_condition:
+            self._recoveries_inflight += 1
+        try:
+            return self.recover_callback()
+        finally:
+            with self._recovery_condition:
+                self._recoveries_inflight -= 1
+                self._recovery_condition.notify_all()
 
     def simulate_successful_ping(self) -> None:
         """Mimic one successful heartbeat cycle: on the unhealthy->healthy
@@ -795,6 +816,42 @@ def test_raising_retrieve_marks_blocks_for_recompute(
     assert "req-1" not in adapter.retrieve_futures
 
 
+@pytest.mark.parametrize("lazy_offload", [False, True])
+@pytest.mark.parametrize("failure_site", ["query", "result"])
+def test_raising_store_reports_terminal_completion_once(
+    fake_adapter,
+    lazy_offload: bool,
+    failure_site: str,
+) -> None:
+    """A terminal store exception releases tracking and is reported once."""
+    adapter, _send_mock, _future = fake_adapter
+    adapter.lazy_offload = lazy_offload
+    store_future = MagicMock(name="store_future")
+    store_future.query.return_value = True
+    if failure_site == "query":
+        store_future.query.side_effect = RuntimeError("query failed")
+    else:
+        store_future.result.side_effect = RuntimeError("result failed")
+    adapter.store_futures["req-1"] = store_future
+    adapter.store_events["req-1"] = FakeCudaEvent()
+
+    if lazy_offload:
+        finished_stores, finished_retrieves = adapter.get_finished_with_lazy_offload()
+        assert finished_stores is None
+        assert adapter.get_completed_store_requests() == {"req-1": 1}
+        second_stores, _second_retrieves = adapter.get_finished_with_lazy_offload()
+        assert second_stores is None
+    else:
+        finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
+        assert finished_stores == {"req-1"}
+        second_stores, _second_retrieves = adapter.get_finished({"req-1"})
+        assert second_stores == set()
+
+    assert finished_retrieves == set()
+    assert "req-1" not in adapter.store_futures
+    assert "req-1" not in adapter.store_events
+
+
 def test_failed_full_retrieve_is_recomputed_instead_of_retried_remotely() -> None:
     """A failed full async load must not re-enter remote wait forever."""
     pytest.importorskip("vllm")
@@ -1098,6 +1155,57 @@ def test_scheduler_shutdown_stops_heartbeats_then_closes_clients(
         client.close.assert_called_once()
 
 
+@pytest.mark.parametrize("failure", [TimeoutError("timeout"), RuntimeError("failed")])
+def test_status_failure_releases_lookup_locks_once(
+    fake_scheduler_adapter,
+    failure: Exception,
+) -> None:
+    """Abandoning a status query transfers lock ownership back once."""
+    _fixture_adapter, send_mock = fake_scheduler_adapter
+    adapter = _make_scheduler_adapter(["tcp://127.0.0.1:5555"])
+    send_mock.reset_mock()
+    lookup_future = MagicMock(name="lookup_future")
+    lookup_future.result.return_value = None
+    failed_status = MagicMock(name="failed_status")
+    failed_status.result.side_effect = failure
+    release_future = MagicMock(name="release_future")
+    send_mock.side_effect = [lookup_future, failed_status, release_future]
+
+    adapter.maybe_submit_lookup_request("req-1", list(range(256)))
+    assert adapter.check_lookup_result("req-1") == 0
+    calls_after_failure = list(send_mock.call_args_list)
+    assert [call.args[1] for call in calls_after_failure] == [
+        RequestType.LOOKUP,
+        RequestType.QUERY_PREFETCH_STATUS,
+        RequestType.FREE_LOOKUP_LOCKS,
+    ]
+
+    assert adapter.check_lookup_result("req-1") == 0
+    assert send_mock.call_args_list == calls_after_failure
+
+
+def test_lookup_ack_timeout_releases_possible_server_locks_once(
+    fake_scheduler_adapter,
+) -> None:
+    """A lost LOOKUP acknowledgement cannot orphan server read locks."""
+    _fixture_adapter, send_mock = fake_scheduler_adapter
+    adapter = _make_scheduler_adapter(["tcp://127.0.0.1:5555"])
+    send_mock.reset_mock()
+    failed_lookup = MagicMock(name="failed_lookup")
+    failed_lookup.result.side_effect = TimeoutError("timeout")
+    release_future = MagicMock(name="release_future")
+    send_mock.side_effect = [failed_lookup, release_future]
+
+    adapter.maybe_submit_lookup_request("req-1", list(range(256)))
+
+    assert [call.args[1] for call in send_mock.call_args_list] == [
+        RequestType.LOOKUP,
+        RequestType.FREE_LOOKUP_LOCKS,
+    ]
+    adapter.cleanup_lookup_result("req-1")
+    assert len(send_mock.call_args_list) == 2
+
+
 def test_straggler_cycle_after_stop_skips_callback_and_event(monkeypatch) -> None:
     """Real HeartbeatThread: a ping still in flight when ``stop()`` returns
     completes without firing the recover callback or setting the health
@@ -1311,6 +1419,68 @@ def test_recover_callback_closes_superseded_transfer_ctx(
     contexts[0].close.assert_called_once_with()
     contexts[1].close.assert_called_once_with()
     contexts[-1].close.assert_not_called()
+
+
+def test_shutdown_waits_for_inflight_recovery_before_unregister(
+    fake_adapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown cannot unregister or close MQ during heartbeat recovery."""
+    adapter, send_mock, _future = fake_adapter
+    contexts = _patch_transfer_context_factory(monkeypatch)
+    tensor = MagicMock()
+    tensor.device.type = "cuda"
+    adapter.register_kv_caches({"layer.0": tensor})
+    adapter.submit_store_request("req-1", _op([[0]]), MagicMock())
+    heartbeat = FakeHeartbeatThread.instances[0]
+
+    recovery_entered = threading.Event()
+    release_recovery = threading.Event()
+
+    def delayed_register(*_args: object, **_kwargs: object) -> None:
+        recovery_entered.set()
+        assert release_recovery.wait(timeout=5.0)
+
+    original_factory = adapter_mod.create_transfer_context
+
+    def delayed_factory(
+        kv_caches: dict[str, torch.Tensor],
+        mode: str | MPTransferMode | None,
+    ) -> MagicMock:
+        context = original_factory(kv_caches, mode)
+        context.register.side_effect = delayed_register
+        return context
+
+    monkeypatch.setattr(adapter_mod, "create_transfer_context", delayed_factory)
+    recovery_results: list[bool] = []
+    recovery_thread = threading.Thread(
+        target=lambda: recovery_results.append(heartbeat.recover())
+    )
+    recovery_thread.start()
+    assert recovery_entered.wait(timeout=5.0)
+
+    shutdown_done = threading.Event()
+    shutdown_thread = threading.Thread(
+        target=lambda: (adapter.shutdown(), shutdown_done.set())
+    )
+    shutdown_thread.start()
+    assert not shutdown_done.wait(timeout=0.05)
+    assert not any(
+        call.args[1] == RequestType.UNREGISTER_KV_CACHE
+        for call in send_mock.call_args_list
+    )
+    adapter.mq_client.close.assert_not_called()
+
+    release_recovery.set()
+    recovery_thread.join(timeout=5.0)
+    shutdown_thread.join(timeout=5.0)
+
+    assert not recovery_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert recovery_results == [False]
+    contexts[1].close.assert_called_once_with()
+    contexts[0].close.assert_called_once_with()
+    adapter.mq_client.close.assert_called_once_with()
 
 
 # For the experimental dispatcher

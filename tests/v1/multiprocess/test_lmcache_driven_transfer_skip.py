@@ -294,6 +294,72 @@ def test_retrieve_full_attention_only_reads_everything(monkeypatch):
     assert len(mem) == 3 and all(o is not None for o in mem)
 
 
+def test_retrieve_failure_releases_every_object_group_reservation(monkeypatch):
+    """A mid-retrieve failure releases read locks for untouched groups."""
+    module, _read_calls, _transfer_calls = _make_module(
+        monkeypatch,
+        num_chunks=1,
+        num_chunks_in_sw=[-1, -1, -1],
+    )
+    readers = {"g0c0": 1, "g1c0": 1, "g2c0": 1}
+
+    @contextmanager
+    def read_with_failure_cleanup(keys):
+        try:
+            yield [MagicMock(get_size=MagicMock(return_value=10)) for _ in keys]
+        except Exception:
+            for obj_key in keys:
+                readers[obj_key] -= 1
+            raise
+
+    def finish_read(keys, read_locks=1):
+        for obj_key in keys:
+            readers[obj_key] -= read_locks
+
+    def fail_second_group(
+        cache_context,
+        block_ids,
+        memory_objs,
+        object_group_id,
+        batch_size,
+        skip_first_n_tokens,
+        direction,
+    ):
+        del (
+            cache_context,
+            block_ids,
+            memory_objs,
+            batch_size,
+            skip_first_n_tokens,
+            direction,
+        )
+        if object_group_id == 1:
+            raise RuntimeError("injected second-group retrieve failure")
+
+    module.context.storage_manager.read_prefetched_results.side_effect = (
+        read_with_failure_cleanup
+    )
+    module.context.storage_manager.finish_read_prefetched.side_effect = finish_read
+    monkeypatch.setattr(mod, "transfer_kv_per_object_group", fail_second_group)
+    monkeypatch.setattr(
+        mod,
+        "submit_callback_to_stream",
+        lambda _stream, callback, keys: (
+            finish_read(keys) if callback == "finish_read_prefetched" else None
+        ),
+    )
+
+    _handle, ok = module.retrieve(
+        key=SimpleNamespace(request_id="req", cache_salt="salt"),
+        instance_id=1,
+        gpu_block_ids=[[1], [2], [3]],
+        event_ipc_handle=b"x",
+    )
+
+    assert ok is False
+    assert readers == {"g0c0": 0, "g1c0": 0, "g2c0": 0}
+
+
 def test_retrieve_never_reads_standalone_groups(monkeypatch):
     """The std retrieve skips connector-private (standalone) object groups.
 

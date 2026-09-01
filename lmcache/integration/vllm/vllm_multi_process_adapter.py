@@ -522,6 +522,17 @@ class HeartbeatThread(PeriodicThread):
         """
         self._recover_callback = callback
 
+    def stop_and_wait(self) -> None:
+        """Request stop and wait for an in-progress heartbeat callback."""
+        self.stop()
+        thread = self._thread
+        if (
+            thread is not None
+            and thread is not threading.current_thread()
+            and thread.is_alive()
+        ):
+            thread.join()
+
     def _execute(self) -> ThreadRunSummary:
         """Run one heartbeat cycle: ping, recover callback, event update.
 
@@ -551,6 +562,12 @@ class HeartbeatThread(PeriodicThread):
             )
             # If the callback fails, it should not become healthy
             healthy = self._recover_callback()
+
+        if self.stop_requested:
+            return ThreadRunSummary(
+                success=True,
+                message="stop requested; skipping health update",
+            )
 
         if healthy:
             self._health_event.set()
@@ -821,6 +838,7 @@ class LMCacheMPSchedulerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         ).no_worker_id_version()
+        self._lookup_params[request_id] = (token_ids, cache_salt)
 
         futures: dict[str, MessagingFuture[Any]] = {
             url: send_lmcache_request(
@@ -835,17 +853,53 @@ class LMCacheMPSchedulerAdapter:
         for url, fut in futures.items():
             try:
                 fut.result(timeout=self._mq_timeout)
-            except TimeoutError:
+            except Exception:
                 logger.warning(
-                    "LOOKUP to %s timed out after %ss. Marking server as unhealthy.",
+                    "LOOKUP to %s failed. Releasing possible server locks and "
+                    "marking the server unhealthy.",
                     url,
-                    self._mq_timeout,
+                    exc_info=True,
                 )
+                self._abandon_lookup(request_id)
                 self._health_events[url].clear()
                 return
 
         self._pending_lookups.add(request_id)
-        self._lookup_params[request_id] = (token_ids, cache_salt)
+
+    def _abandon_lookup(self, request_id: str) -> None:
+        """Release a failed lookup's server-owned read locks exactly once."""
+        lookup_params = self._lookup_params.pop(request_id, None)
+        self._pending_lookups.discard(request_id)
+        self._finished_lookup_results.pop(request_id, None)
+        self._per_server_hits.pop(request_id, None)
+        if lookup_params is None:
+            return
+
+        token_ids, cache_salt = lookup_params
+        aligned_end = (
+            len(token_ids) // self.lmcache_tokens_per_chunk
+        ) * self.lmcache_tokens_per_chunk
+        key = self._create_key(
+            token_ids,
+            start=0,
+            end=aligned_end,
+            request_id=request_id,
+            cache_salt=cache_salt,
+        ).no_worker_id_version()
+        for url in self._server_urls:
+            try:
+                send_lmcache_request(
+                    self.mq_clients[url],
+                    RequestType.FREE_LOOKUP_LOCKS,
+                    [key, self.tp_size],
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to release abandoned lookup locks for request %s on %s",
+                    request_id,
+                    url,
+                    exc_info=True,
+                )
 
     def _free_inconsistent_lookup_locks(
         self,
@@ -911,6 +965,7 @@ class LMCacheMPSchedulerAdapter:
 
         if not self.is_healthy:
             # Server went down — give up on this lookup
+            self._abandon_lookup(request_id)
             return 0
 
         if request_id in self._finished_lookup_results:
@@ -935,11 +990,14 @@ class LMCacheMPSchedulerAdapter:
         for url, fut in futures.items():
             try:
                 r = fut.result(timeout=self._mq_timeout)
-            except TimeoutError:
+            except Exception:
                 logger.warning(
-                    "QUERY_PREFETCH_STATUS to %s timed out. Marking unhealthy.",
+                    "QUERY_PREFETCH_STATUS to %s failed. Releasing lookup locks "
+                    "and marking the server unhealthy.",
                     url,
+                    exc_info=True,
                 )
+                self._abandon_lookup(request_id)
                 self._health_events[url].clear()
                 return 0
             if r is None:
@@ -1291,6 +1349,7 @@ class LMCacheMPWorkerAdapter:
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat: HeartbeatThread | None = None
         self._heartbeat_lock = threading.Lock()
+        self._shutdown_requested = threading.Event()
         if 3 * heartbeat_interval > _SERVER_REAP_TIMEOUT_FLOOR_SECONDS:
             logger.warning(
                 "lmcache.mp.heartbeat_interval is %.1fs, so 3 x "
@@ -1400,7 +1459,7 @@ class LMCacheMPWorkerAdapter:
     def _send_register_kv_caches_request(
         self,
         kv_caches: dict[str, torch.Tensor],
-    ) -> None:
+    ) -> bool:
         """Submit a REGISTER_KV_CACHE request and wait for the response.
 
         Shared by the public ``register_kv_caches`` entry point and the
@@ -1408,6 +1467,10 @@ class LMCacheMPWorkerAdapter:
 
         Args:
             kv_caches: The KV cache dict to register.
+
+        Returns:
+            ``True`` when the context is published, or ``False`` when shutdown
+            began while registration was in progress and rejected the context.
 
         Raises:
             ConnectionError: if the server does not respond within
@@ -1485,12 +1548,16 @@ class LMCacheMPWorkerAdapter:
         except BaseException:
             transfer_ctx.close()
             raise
+        if self._shutdown_requested.is_set() or self._heartbeat_stop_requested():
+            transfer_ctx.close()
+            return False
         self.transfer_ctx = transfer_ctx
         if (
             previous_transfer_ctx is not None
             and previous_transfer_ctx is not transfer_ctx
         ):
             previous_transfer_ctx.close()
+        return True
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first store/retrieve.
@@ -1505,7 +1572,7 @@ class LMCacheMPWorkerAdapter:
         if self._heartbeat is not None:
             return
         with self._heartbeat_lock:
-            if self._heartbeat is not None:
+            if self._heartbeat is not None or self._shutdown_requested.is_set():
                 return
             heartbeat = HeartbeatThread(
                 mq_client=self.mq_client,
@@ -1543,12 +1610,13 @@ class LMCacheMPWorkerAdapter:
             return True
 
         # Skip the rebuild if a shutdown already requested the heartbeat stop.
-        if self._heartbeat_stop_requested():
+        if self._shutdown_requested.is_set() or self._heartbeat_stop_requested():
             logger.info("Heartbeat stop requested; skipping KV cache re-registration")
             return False
 
         try:
-            self._send_register_kv_caches_request(self.kv_caches)
+            if not self._send_register_kv_caches_request(self.kv_caches):
+                return False
         except ConnectionError:
             logger.exception(
                 "Failed to re-register KV caches after server recovery; "
@@ -2007,8 +2075,9 @@ class LMCacheMPWorkerAdapter:
         re-register or flip the health event after unregistration.
         """
         with self._heartbeat_lock:
+            self._shutdown_requested.set()
             if self._heartbeat is not None:
-                self._heartbeat.stop()
+                self._heartbeat.stop_and_wait()
 
         logger.info("Unregistering kv caches")
         try:
@@ -2044,9 +2113,17 @@ class LMCacheMPWorkerAdapter:
         """Return terminal store request IDs and log unsuccessful stores."""
         finished: set[str] = set()
         for request_id, future in self.store_futures.items():
-            if not future.query():
+            try:
+                if not future.query():
+                    continue
+                result = future.result(timeout=60)
+            except Exception:
+                finished.add(request_id)
+                logger.exception(
+                    "LMCache store raised for request_id=%s",
+                    request_id,
+                )
                 continue
-            result = future.result(timeout=60)
             finished.add(request_id)
             if not result:
                 logger.error("LMCache store failed for request_id=%s", request_id)

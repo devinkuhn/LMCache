@@ -252,18 +252,6 @@ class CuMemFDBroker:
                     or stat.S_ISLNK(metadata.st_mode)
                 ):
                     continue
-                try:
-                    owner_pid = int(candidate.name.split("-", 2)[1])
-                except (IndexError, ValueError):
-                    continue
-                try:
-                    os.kill(owner_pid, 0)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    continue
-                else:
-                    continue
                 probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
                     probe.settimeout(0.05)

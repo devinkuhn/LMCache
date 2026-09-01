@@ -1651,10 +1651,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             prefetched_keys: list[ObjectKey] = []
             total_bytes = 0
             retrieve_succeeded = True
+            last_attempted_group = -1
             try:
                 for obj_group_id in range(num_object_groups):
                     if obj_group_id in skipped_groups:
                         continue
+                    last_attempted_group = obj_group_id
                     skip = group_skips[obj_group_id]
                     in_window_keys = obj_keys_per_obj_group[obj_group_id][skip:]
                     with self._ctx.storage_manager.read_prefetched_results(
@@ -1698,6 +1700,22 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "finish_read_prefetched",
                         prefetched_keys,
                     )
+                if not retrieve_succeeded:
+                    untouched_keys = [
+                        obj_key
+                        for group_id in range(
+                            last_attempted_group + 1, num_object_groups
+                        )
+                        if group_id not in skipped_groups
+                        for obj_key in obj_keys_per_obj_group[group_id][
+                            group_skips[group_id] :
+                        ]
+                    ]
+                    if untouched_keys:
+                        self._ctx.storage_manager.finish_read_prefetched(
+                            untouched_keys,
+                            read_locks=1,
+                        )
                 num_tokens = (
                     num_chunks * self._ctx.chunk_size
                     if len(prefetched_keys) == expected_retained
