@@ -21,6 +21,7 @@ from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_mod
 from lmcache.integration.vllm.experimental.dispatcher import Dispatcher
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     HeartbeatThread,
+    LMCacheMPSchedulerAdapter,
     LMCacheMPWorkerAdapter,
     LoadStoreOp,
     ParallelStrategy,
@@ -121,6 +122,31 @@ def _make_worker_adapter(
     )
 
 
+def _make_scheduler_adapter(
+    server_urls: list[str] | None = None,
+) -> LMCacheMPSchedulerAdapter:
+    """Construct a scheduler adapter; the network boundary must already
+    be patched (see ``fake_scheduler_adapter``)."""
+    if server_urls is None:
+        server_urls = ["tcp://127.0.0.1:5555", "tcp://127.0.0.1:5556"]
+    parallel_strategy = ParallelStrategy(
+        mla_only=False,
+        vllm_world_size=1,
+        vllm_worker_id=0,
+        tp_size=1,
+        pp_size=1,
+        n_servers=len(server_urls),
+    )
+    return LMCacheMPSchedulerAdapter(
+        server_urls=server_urls,
+        context=MagicMock(name="zmq_context"),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=parallel_strategy,
+        mq_timeout=5.0,
+    )
+
+
 def _op(block_ids: list[list[int]]) -> LoadStoreOp:
     """Build a minimal four-token ``LoadStoreOp`` over *block_ids*."""
     return LoadStoreOp(token_ids=[1, 2, 3, 4], block_ids=block_ids, start=0, end=4)
@@ -188,6 +214,35 @@ def fake_adapter(monkeypatch):
     # so individual tests start with a clean call count.
     send_mock.reset_mock()
     return adapter, send_mock, future
+
+
+@pytest.fixture
+def fake_scheduler_adapter(monkeypatch: pytest.MonkeyPatch):
+    """Build a scheduler adapter with the network boundary stubbed.
+
+    Returns ``(adapter, send_mock)``. ``HeartbeatThread`` is replaced by
+    ``FakeHeartbeatThread``. One MQ client is created per server URL.
+    """
+
+    def fake_client(*args: object, **kwargs: object) -> MagicMock:
+        url = args[0] if args else kwargs.get("url", "unknown")
+        return MagicMock(name=f"mq_client_{url}")
+
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", fake_client)
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
+
+    future = MagicMock(name="future")
+    future.result.return_value = None
+    send_mock = MagicMock(name="send_lmcache_request", return_value=future)
+    monkeypatch.setattr(adapter_mod, "send_lmcache_request", send_mock)
+
+    FakeHeartbeatThread.instances.clear()
+    FakeHeartbeatThread.start_hook = None
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+
+    adapter = _make_scheduler_adapter()
+    send_mock.reset_mock()
+    return adapter, send_mock
 
 
 def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
@@ -827,6 +882,67 @@ def test_shutdown_without_heartbeat_sends_unregister(fake_adapter) -> None:
     args, _kwargs = send_mock.call_args
     assert args[1] == RequestType.UNREGISTER_KV_CACHE
     assert args[2] == [adapter.instance_id]
+
+
+@pytest.mark.no_shared_allocator
+def test_scheduler_heartbeat_lazy_start_once_for_all_servers(
+    fake_scheduler_adapter,
+) -> None:
+    """Scheduler heartbeats start lazily on first lookup: one thread per
+    server. A second lookup must not start additional threads."""
+    adapter, _send_mock = fake_scheduler_adapter
+    assert FakeHeartbeatThread.instances == []
+
+    adapter.maybe_submit_lookup_request("req-1", list(range(256)))
+
+    assert len(FakeHeartbeatThread.instances) == len(adapter.mq_clients)
+    started_clients = {hb.mq_client for hb in FakeHeartbeatThread.instances}
+    assert started_clients == set(adapter.mq_clients.values())
+    for hb in FakeHeartbeatThread.instances:
+        assert hb.calls == ["start"]
+        assert hb.health_event_set_at_init is True
+
+    adapter.maybe_submit_lookup_request("req-2", list(range(256)))
+    assert len(FakeHeartbeatThread.instances) == len(adapter.mq_clients)
+
+
+@pytest.mark.no_shared_allocator
+def test_scheduler_shutdown_before_heartbeat_initialization(
+    fake_scheduler_adapter,
+) -> None:
+    """Cold shutdown before any lookup does not start heartbeats and
+    still closes every message-queue client."""
+    adapter, _send_mock = fake_scheduler_adapter
+
+    adapter.shutdown()
+
+    assert FakeHeartbeatThread.instances == []
+    for client in adapter.mq_clients.values():
+        client.close.assert_called_once()
+
+
+@pytest.mark.no_shared_allocator
+def test_scheduler_shutdown_stops_heartbeats_then_closes_clients(
+    fake_scheduler_adapter,
+) -> None:
+    """After heartbeats start, shutdown stops every thread before
+    closing MQ clients."""
+    adapter, _send_mock = fake_scheduler_adapter
+    adapter.maybe_submit_lookup_request("req-1", list(range(256)))
+    assert FakeHeartbeatThread.instances
+
+    def assert_heartbeats_stopped(*_args: object, **_kwargs: object) -> None:
+        assert all(hb.stop_requested for hb in FakeHeartbeatThread.instances)
+
+    for client in adapter.mq_clients.values():
+        client.close.side_effect = assert_heartbeats_stopped
+
+    adapter.shutdown()
+
+    for hb in FakeHeartbeatThread.instances:
+        assert "stop" in hb.calls
+    for client in adapter.mq_clients.values():
+        client.close.assert_called_once()
 
 
 def test_straggler_cycle_after_stop_skips_callback_and_event(monkeypatch) -> None:

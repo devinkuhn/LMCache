@@ -696,11 +696,10 @@ class LMCacheMPSchedulerAdapter:
             ev.set()
             self._health_events[url] = ev
 
-        # Heartbeat thread is created but NOT started yet.
-        # It will be lazily started on the first lookup
-        # request, by which time vLLM is fully ready.
+        # Heartbeats are lazily started on the first lookup, by which
+        # time vLLM is fully ready. None means they have not started.
         self._heartbeat_interval = heartbeat_interval
-        self._heartbeats: dict[str, HeartbeatThread] = {}
+        self._heartbeats: dict[str, HeartbeatThread] | None = None
         self._heartbeat_lock = threading.Lock()
 
         # For TP/PP: track partial store completions across steps.
@@ -724,12 +723,17 @@ class LMCacheMPSchedulerAdapter:
         return all(ev.is_set() for ev in self._health_events.values())
 
     def _ensure_heartbeat_started(self) -> None:
-        """Lazily start the heartbeat thread on first use."""
+        """Lazily start one heartbeat thread per server on first use.
+
+        Threads are assembled in a local dict and published atomically so
+        concurrent callers never observe a partially initialized map.
+        """
         if self._heartbeats is not None:
             return
         with self._heartbeat_lock:
             if self._heartbeats is not None:
                 return
+            heartbeats: dict[str, HeartbeatThread] = {}
             for url, client in self.mq_clients.items():
                 hb = HeartbeatThread(
                     mq_client=client,
@@ -737,7 +741,8 @@ class LMCacheMPSchedulerAdapter:
                     interval=self._heartbeat_interval,
                 )
                 hb.start()
-                self._heartbeats[url] = hb
+                heartbeats[url] = hb
+            self._heartbeats = heartbeats
 
     @_lmcache_nvtx_annotate
     def maybe_submit_lookup_request(
@@ -953,12 +958,19 @@ class LMCacheMPSchedulerAdapter:
         self._lookup_params.pop(request_id, None)
 
     def shutdown(self) -> None:
-        """Shutdown the scheduler adapter and its resources."""
+        """Shutdown the scheduler adapter and its resources.
+
+        Stops any initialized heartbeat threads before closing MQ clients
+        so in-flight pings do not race a closed socket. Safe when
+        heartbeats were never started.
+        """
+        with self._heartbeat_lock:
+            heartbeats = self._heartbeats
+            if heartbeats is not None:
+                for hb in heartbeats.values():
+                    hb.stop()
         for client in self.mq_clients.values():
             client.close()
-        with self._heartbeat_lock:
-            for hb in self._heartbeats.values():
-                hb.stop()
 
     def free_lookup_locks(
         self,
